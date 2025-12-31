@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+<muclient>
+<plugin
+   name="Aardwolf_Direction_Interceptor"
+   author=""
+   id="e1a5e1a5e1a5e1a5e1a5e1a5"
+   language="Lua"
+   purpose="Intercepts direction commands to use mapper cexits if they exist"
+   save_state="y"
+   version="1.0"
+   >
+</plugin>
+
+<!--  Aliases  -->
+
+<aliases>
+  <alias
+   match="^(n|s|e|w|u|d|north|south|east|west|up|down)$"
+   enabled="y"
+   regexp="y"
+   sequence="1"
+   ignore_case="y"
+   send_to="12"
+  >
+  <send>
+    check_direction("%1")
+  </send>
+  </alias>
+</aliases>
+
+<!--  Script  -->
+
+<script>
+<![CDATA[
+local sqlite3 = require "sqlite3"
+
+local db = nil
+local current_room = nil
+local mapper_id = "b6eae87ccedd84f510b74714"
+local gmcp_handler_id = "3e7dedbe37e44942dd46d264"
+
+local short_to_long = {
+   n = "north", s = "south", e = "east", w = "west", u = "up", d = "down"
+}
+local long_to_short = {
+   north = "n", south = "s", east = "e", west = "w", up = "u", down = "d"
+}
+
+function OnPluginInstall()
+   Note("Direction Interceptor installed. Intercepting n, s, e, w, u, d...")
+   open_db()
+end
+
+function open_db()
+   local db_name = GetPluginVariable(mapper_id, "db_name")
+   if not db_name or db_name == "" then
+      -- Mapper might not be initialized yet, try again in a bit
+      DoAfterSpecial(2, 'open_db()', 12)
+      return
+   end
+   
+   local db_path = GetInfo(66) .. db_name .. ".db"
+   if db then 
+      if db:isopen() then db:close() end
+   end
+   
+   local err
+   db, err = sqlite3.open(db_path)
+   if not db then
+      Note("Direction Interceptor: Could not open database: " .. tostring(err))
+   end
+end
+
+local function parse_gmcp_data(gmcparg)
+   if not gmcparg or gmcparg == "" or gmcparg == '""' then return nil end
+   local f, err = loadstring("return " .. gmcparg)
+   if f then
+      local ok, result = pcall(f)
+      if ok then
+         return result
+      else
+         Note("Direction Interceptor Debug: Execution error parsing GMCP: " .. tostring(result))
+      end
+   else
+      Note("Direction Interceptor Debug: Syntax error parsing GMCP: " .. tostring(err))
+   end
+   return nil
+end
+
+function OnPluginBroadcast (msg, id, name, text)
+   if id == gmcp_handler_id then -- GMCP handler
+      if text == "room.info" or text == "room" then
+         local res, gmcparg = CallPlugin(gmcp_handler_id, "gmcpdata_as_string", text)
+         if res == 0 then
+            local room_data = parse_gmcp_data(gmcparg)
+            if room_data and room_data.num then
+               current_room = tostring(room_data.num)
+               -- Note("Direction Interceptor Debug: Room updated to: " .. current_room)
+            end
+         end
+      end
+   end
+end
+
+function fixsql (s)
+   if s then
+      return "'" .. (string.gsub (s, "'", "''")) .. "'"
+   else
+      return "NULL"
+   end
+end
+
+function get_current_room()
+   local res, gmcparg = CallPlugin(gmcp_handler_id, "gmcpdata_as_string", "room.info")
+   if res == 0 then
+      local room_data = parse_gmcp_data(gmcparg)
+      if room_data and room_data.num then
+         return tostring(room_data.num)
+      end
+   end
+   return nil
+end
+
+local is_intercepting = false
+
+function check_direction(dir_input)
+   local dir = dir_input:lower()
+   local short_dir = long_to_short[dir] or dir
+   local long_dir = short_to_long[dir] or dir
+   
+   -- Re-entrancy guard: If we are already in the middle of a mapper goto call,
+   -- don't intercept again. This allows the mapper's own movements to pass through.
+   if is_intercepting then
+      Send(dir_input)
+      return
+   end
+
+   -- If we don't know where we are, try to fetch it now
+   if not current_room then
+      current_room = get_current_room()
+   end
+
+   if not current_room then
+      Send(dir_input)
+      return
+   end
+
+   -- Ensure DB is open
+   if not db or not db:isopen() then
+      open_db()
+      if not db or not db:isopen() then
+         Send(dir_input)
+         return
+      end
+   end
+
+   -- 1. Find the destination for the normal direction ('n', 's', etc.)
+   local dest_uid = nil
+   local query = string.format("SELECT touid FROM exits WHERE fromuid = %s AND dir = %s", fixsql(current_room), fixsql(short_dir))
+   
+   for row in db:nrows(query) do
+      dest_uid = row.touid
+   end
+   
+   if not dest_uid then
+      Send(dir_input)
+      return
+   end
+   
+   -- 2. Check if there is a cexit to that same destination matching the pattern
+   -- Pattern: "open n;n" or "open north;north" (supporting both ; and ;; separators)
+   local found_cexit = false
+   local patterns = {
+      "open " .. short_dir .. ";" .. short_dir,
+      "open " .. long_dir .. ";" .. long_dir
+   }
+   
+   local q2 = string.format("SELECT dir FROM exits WHERE fromuid = %s AND touid = %s", fixsql(current_room), fixsql(dest_uid))
+   for row in db:nrows(q2) do
+      local exit_dir = row.dir:lower()
+      for _, p in ipairs(patterns) do
+         if exit_dir == p then
+            found_cexit = true
+            break
+         end
+      end
+      if found_cexit then break end
+   end
+   
+   if found_cexit then
+      is_intercepting = true
+      Execute("mapper goto " .. dest_uid)
+      is_intercepting = false
+   else
+      Send(dir_input)
+   end
+end
+]]>
+</script>
+</muclient>
