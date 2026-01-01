@@ -549,7 +549,7 @@ local function add_another_room (uid, path, x, y)
    return {uid=uid, path=path, x = x, y = y}
 end  -- add_another_room
 
-local function draw_room (uid, path, x, y)
+local function draw_room (uid, path, x, y, keep_hotspots)
    uid = tostring(uid)
    local grid_size = ROOM_SIZE + DISTANCE_TO_NEXT_ROOM
    local room = rooms [uid] or get_room (uid)
@@ -738,19 +738,21 @@ local function draw_room (uid, path, x, y)
       end
    end -- if
 
-   WindowAddHotspot(win, uid,
-      left, top, right, bottom,   -- rectangle
-      "",  -- mouseover
-      "",  -- cancelmouseover
-      "mapper.mousedown_room",  -- mousedown
-      "",  -- cancelmousedown
-      "mapper.mouseup_room",  -- mouseup
-      room.hovermessage,
-      miniwin.cursor_hand, 0)  -- hand cursor
+   if not keep_hotspots then
+      WindowAddHotspot(win, uid,
+         left, top, right, bottom,   -- rectangle
+         "",  -- mouseover
+         "",  -- cancelmouseover
+         "mapper.mousedown_room",  -- mousedown
+         "",  -- cancelmousedown
+         "mapper.mouseup_room",  -- mouseup
+         room.hovermessage,
+         miniwin.cursor_hand, 0)  -- hand cursor
 
-   WindowDragHandler (win, uid, "mapper.dragmove_room", "mapper.dragrelease_room", 0)
+      WindowDragHandler (win, uid, "mapper.dragmove_room", "mapper.dragrelease_room", 0)
 
-   WindowScrollwheelHandler (win, uid, "mapper.zoom_map")
+      WindowScrollwheelHandler (win, uid, "mapper.zoom_map")
+   end -- if
 end -- draw_room
 
 local function changed_room (uid)
@@ -915,7 +917,7 @@ function dress_window(room_name, room_uid, area_name)
    end
 end
 
-function draw (uid)
+function draw (uid, keep_hotspots)
    if not uid then
       maperror "Cannot draw map right now, I don't know where you are - try: LOOK"
       return
@@ -960,7 +962,7 @@ function draw (uid)
       config.WINDOW.width,
       config.WINDOW.height,
       windowinfo.window_mode,   -- top right
-      windowinfo.window_flags,
+      windowinfo.window_flags + ((keep_hotspots and miniwin.create_keep_hotspots) or 0),
       Theme.PRIMARY_BODY)
 
    -- Handle background texture.
@@ -1001,7 +1003,7 @@ function draw (uid)
       local old_generation = rooms_to_be_drawn
       rooms_to_be_drawn = {}  -- new generation
       for i, part in ipairs (old_generation) do
-         draw_room (part.uid, part.path, part.x, part.y)
+         draw_room (part.uid, part.path, part.x, part.y, keep_hotspots)
       end -- for each existing room
       depth = depth + 1
    end -- while all rooms_to_be_drawn
@@ -1871,39 +1873,8 @@ function dragmove_room (flags, hotspot_id)
    if off_x ~= drag_current_offset_x or off_y ~= drag_current_offset_y then
       drag_current_offset_x = off_x
       drag_current_offset_y = off_y
+      draw(current_room, true)
    end
-   
-   -- Schedule a save for 500ms after the last drag movement
-   -- This will be called when dragging stops
-   drag_last_move_time = os.clock()
-   if GetTimer(drag_save_timer_id) ~= nil then
-      DeleteTimer(drag_save_timer_id)
-   end
-   AddTimer(drag_save_timer_id, 0, 0, 0.5, "", timer_flag.Enabled + timer_flag.OneShot + timer_flag.Replace, "mapper.save_drag_offset")
-end
-
-function save_drag_offset()
-   local time_since_last_move = os.clock() - drag_last_move_time
-   if time_since_last_move < 0.4 then
-      AddTimer(drag_save_timer_id, 0, 0, 0.5, "", timer_flag.Enabled + timer_flag.OneShot + timer_flag.Replace, "mapper.save_drag_offset")
-      return
-   end
-   
-   if not drag_room_uid then 
-      return 
-   end
-   
-   local final_x = drag_initial_offset_x + drag_current_offset_x
-   local final_y = drag_initial_offset_y + drag_current_offset_y
-   
-   if final_x ~= drag_initial_offset_x or final_y ~= drag_initial_offset_y then
-      if type (save_offset) == "function" then
-         save_offset (drag_room_uid, final_x, final_y)
-      end
-   end
-   
-   drag_room_uid = nil
-   draw (current_room)
 end
 
 function dragrelease_room (flags, hotspot_id)
