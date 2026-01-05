@@ -126,7 +126,7 @@ Allows dragging rooms to change their positions.
         room_size_factor = val
         SetVariable("room_size_factor", val)
         draw_map()
-        print("Grid Mapper: Room size factor set to " .. val .. " (Default: 0.5)")
+        print("Grid Mapper: Room size factor set to " .. val .. " (Default: 0.6)")
     else
         print("Grid Mapper: Usage: gridmapper roomsize [0.1 to 1.0]")
     end
@@ -232,7 +232,7 @@ room_rects = {}     -- Hit-test rectangles for mouse interaction
 scale = tonumber(GetVariable("scale") or 30) or 30
 offset_x = tonumber(GetVariable("offset_x") or 0) or 0
 offset_y = tonumber(GetVariable("offset_y") or 0) or 0
-room_size_factor = tonumber(GetVariable("room_size_factor") or 0.5) or 0.5
+room_size_factor = tonumber(GetVariable("room_size_factor") or 0.6) or 0.6
 -- Font Settings (User Configurable)
 user_font_name = GetVariable("user_font_name") or "Dina"
 user_font_size = tonumber(GetVariable("user_font_size")) or 8
