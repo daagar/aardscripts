@@ -6,19 +6,17 @@ Random stuff for Aardwolf's MUSHclient, typically in the form of plugins.
 
 Intercepts direction commands to use mapper cexits if they exist.
 
-## aard_GMCP_mapper_custom.xml
+## aard_Grid_Mapper.xml
 
-Proof of concept for being able to shift-click and drag a room on the map to move it. Great for areas that overlap. 
+Proof of concept for being able to drag a room on the map to move it. Great for areas that overlap. Rooms that are overlaping will be shown with a "stacked sheet of paper" style look so it is easier to identify. 
 
-This is safe to install along with the default mapper. It uses a separate database to store room position offsets, and no modifications are done to the default mapper database. Obviously, if this was more than a POC you wouldn't _need_ both mappers running. 
+This is safe to (and necessary to) install along with the default mapper. It uses a separate database to store room position offsets, and no modifications are done to the default mapper database. It is still using the original mapper for pretty much everything else - this is _just_ handling the display. 
 
-Example screenshot of the north end of Aylor where things normally overlap in the temple area - I was able to drag the rooms around to make it visually 'correct':
+Example screenshot of the Land of the Beer Goblins, with all rooms spread out:
 
-![Aylor](aylor_map_example.png)
+![Beer Goblins](beer.png)
 
-Limitations:
-* Not real-time dragging. It will feel janky. 
-* Can only move one room at a time. Not exactly a Mudlet-like experience. 
-* You can't move a room indefintely and in all directions in one drag. More jank. 
+### Usage
 
+Install the plugin as normal. Use "gridmapper help" in-game to see available commands.
 

@@ -1,0 +1,1127 @@
+<?xml version="1.0" encoding="iso-8859-1"?>
+<!DOCTYPE muclient>
+
+<muclient>
+<plugin
+   name="Aardwolf_Grid_Mapper"
+   author=""
+   id="497040404040404040404040"
+   language="Lua"
+   purpose="Absolute grid-based mapper for Aardwolf"
+   requires="4.59"
+   version="1.6"
+   save_state="y"
+>
+<description trim="y">
+Alternative mapper visualization that uses an absolute grid system.
+Allows dragging rooms to change their positions.
+</description>
+</plugin>
+
+<aliases>
+  <alias
+   match="^gridmapper zoom (in|out)$"
+   enabled="y"
+   regexp="y"
+   send_to="12"
+   sequence="100"
+  >
+  <send>
+    if "%1" == "in" then
+        zoom_in()
+    else
+        zoom_out()
+    end
+  </send>
+  </alias>
+  
+  <alias
+   match="^gridmapper reset$"
+   enabled="y"
+   regexp="y"
+   send_to="12"
+   sequence="100"
+  >
+  <send>
+    reset_area_positions()
+  </send>
+  </alias>
+
+  <alias
+   match="^gridmapper debug$"
+   enabled="y"
+   regexp="y"
+   send_to="12"
+   sequence="100"
+  >
+  <send>
+    gridmapper_debug()
+  </send>
+  </alias>
+
+  <alias
+   match="^gridmapper (show|hide)$"
+   enabled="y"
+   regexp="y"
+   send_to="12"
+   sequence="100"
+  >
+  <send>
+    local show = ("%1" == "show")
+    GRID_WINDOW_VISIBLE = show
+    SetVariable("window_visible", show and "1" or "0")
+    if show then
+        if not current_room then
+           Send_GMCP_Packet("request room")
+        end
+        draw_map()
+        WindowShow(GRID_WIN, true)
+    else
+        WindowShow(GRID_WIN, false)
+    end
+  </send>
+  </alias>
+
+  <alias
+   match="^gridmapper autocenter (on|off)$"
+   enabled="y"
+   regexp="y"
+   send_to="12"
+   sequence="100"
+  >
+  <send>
+    AUTO_CENTER = ("%1" == "on")
+    SetVariable("auto_center", AUTO_CENTER and "1" or "0")
+    if AUTO_CENTER then 
+       auto_center() 
+       draw_map()
+    end
+    print("Grid Mapper: Auto-center is now " .. (AUTO_CENTER and "ON" or "OFF"))
+  </send>
+  </alias>
+
+  <alias
+   match="^gridmapper center$"
+   enabled="y"
+   regexp="y"
+   send_to="12"
+   sequence="100"
+  >
+  <send>
+    auto_center()
+    draw_map()
+  </send>
+  </alias>
+
+  <alias
+   match="^gridmapper roomsize (.*)$"
+   enabled="y"
+   regexp="y"
+   send_to="12"
+   sequence="100"
+  >
+  <send><![CDATA[
+    local val = tonumber("%1")
+    if val and val >= 0.1 and val <= 1.0 then
+        room_size_factor = val
+        SetVariable("room_size_factor", val)
+        draw_map()
+        print("Grid Mapper: Room size factor set to " .. val .. " (Default: 0.5)")
+    else
+        print("Grid Mapper: Usage: gridmapper roomsize [0.1 to 1.0]")
+    end
+  ]]></send>
+  </alias>
+  <alias
+   match="^gridmapper font$"
+   enabled="y"
+   regexp="y"
+   send_to="12"
+   sequence="100"
+  >
+  <send><![CDATA[
+    local win = GetPluginID()
+    local f = utils.fontpicker(user_font_name, user_font_size)
+    if f then
+       user_font_name = f.name
+       user_font_size = f.size
+       SetVariable("user_font_name", user_font_name)
+       SetVariable("user_font_size", tostring(user_font_size))
+       
+       WindowFont(win, "f", user_font_name, user_font_size)
+       WindowFont(win, "title", user_font_name, user_font_size + 1, true)
+       auto_center()
+       draw_map()
+       OnPluginSaveState() -- Force save immediately
+       print("Grid Mapper: Font set to " .. user_font_name .. " " .. user_font_size)
+    end
+  ]]></send>
+  </alias>
+  <alias
+   match="^gridmapper help$"
+   enabled="y"
+   regexp="y"
+   send_to="12"
+   sequence="100"
+  >
+  <send><![CDATA[
+    ColourNote("gold", "", "Grid Mapper Help:")
+    ColourNote("silver", "", "  gridmapper show|hide             - Toggle mapper window visibility")
+    ColourNote("silver", "", "  gridmapper autocenter on|off     - Toggle auto-centering on movement")
+    ColourNote("silver", "", "  gridmapper center                - Find and center on current room")
+    ColourNote("silver", "", "  gridmapper roomsize <0.1-1.0>    - Set room size factor (default 0.5)")
+    ColourNote("silver", "", "  gridmapper font                  - Choose font name and size")
+    ColourNote("silver", "", "  gridmapper help                  - Show this help message")
+    ColourNote("gray", "",   "  (Double-click or Alt-Click a room to speedwalk)")
+    ColourNote("gray", "",   "  (Ctrl-Click a room to see info)")
+    ColourNote("gray", "",   "  (Shift-Drag to select multiple rooms)")
+  ]]></send>
+  </alias>
+</aliases>
+
+<!-- ========================================================================= -->
+<!--  Main Scripting Section                                                   -->
+<!-- ========================================================================= -->
+<script>
+<![CDATA[
+-- ---------------------------------------------------------------------------
+--  Library Imports
+-- ---------------------------------------------------------------------------
+local sqlite3 = require "sqlite3"
+local bit = require "bit"
+require "movewindow"  -- Helper for saving window state/position
+
+-- ---------------------------------------------------------------------------
+--  Constants
+-- ---------------------------------------------------------------------------
+-- Mouse flags for input handling if miniwin doesn't provide them
+local LH_MOUSE = 0x10
+local RH_MOUSE = 0x20
+local SHIFT = 0x01
+local CONTROL = 0x02
+local ALT = 0x04
+local DOUBLE_CLICK = 0x4000
+require "copytable"
+require "tprint"
+require "gmcphelper"
+
+-- Import Theme for consistent look
+require "mw_theme_base"
+
+-- ---------------------------------------------------------------------------
+--  Global Variables & State
+-- ---------------------------------------------------------------------------
+GRID_WIN = GetPluginID()
+local win = GRID_WIN
+
+-- Database Handling
+local pos_db   -- SQLite DB for saving custom room coordinates
+local main_db  -- SQLite DB for reading Aardwolf world data
+
+-- Game State
+current_room = nil
+current_area = nil
+current_area_name = nil -- Full text name of the area
+
+-- Map Data
+rooms = {}          -- Table of all room data in the current area
+room_positions = {} -- Table of {x,y,z} coordinates keyed by room UID
+room_rects = {}     -- Hit-test rectangles for mouse interaction
+
+-- View Settings
+scale = tonumber(GetVariable("scale") or 30) or 30
+offset_x = tonumber(GetVariable("offset_x") or 0) or 0
+offset_y = tonumber(GetVariable("offset_y") or 0) or 0
+room_size_factor = tonumber(GetVariable("room_size_factor") or 0.5) or 0.5
+-- Font Settings (User Configurable)
+user_font_name = GetVariable("user_font_name") or "Dina"
+user_font_size = tonumber(GetVariable("user_font_size")) or 8
+
+-- Caches and Lookups
+known_rooms = {}         -- Global set of all known room UIDs (for coloring stubs)
+terrain_colours = {}     -- Maps terrain name -> RGB color (from DB)
+user_terrain_colour = {} -- Maps terrain name -> RGB color (User overrides)
+
+-- Default Color Palettes
+colour_lookup = {
+   [0] =   ColourNameToRGB "black",
+   [1] =   ColourNameToRGB "maroon",
+   [2] =   ColourNameToRGB "green",
+   [3] =   ColourNameToRGB "olive",
+   [4] =   ColourNameToRGB "navy",
+   [5] =   ColourNameToRGB "purple",
+   [6] =   ColourNameToRGB "teal",
+   [7] =   ColourNameToRGB "silver",
+   [8] =   ColourNameToRGB "gray",
+   [9] =   ColourNameToRGB "red",
+   [10] =  ColourNameToRGB "lime",
+   [11] =  ColourNameToRGB "yellow",
+   [12] =  ColourNameToRGB "blue",
+   [13] =  ColourNameToRGB "magenta",
+   [14] =  ColourNameToRGB "cyan",
+   [15] =  ColourNameToRGB "white",
+}
+
+-- Special Room Colors (Overriding Terrain)
+SPECIAL_COLORS = {
+   shop    = ColourNameToRGB "#ffad2f",
+   healer  = ColourNameToRGB "#9acd32",
+   guild   = ColourNameToRGB "magenta",
+   trainer = ColourNameToRGB "#9acd32",
+   questor = ColourNameToRGB "deepskyblue",
+   bank    = ColourNameToRGB "#ffD700",
+   safe    = ColourNameToRGB "lightblue"
+}
+PK_COLOR = ColourNameToRGB "red"
+local dragging_room = nil
+local dragging_map = false
+local last_mouse_x = 0
+local last_mouse_y = 0
+local start_resize_x = 0
+local start_resize_y = 0
+
+selected_rooms = {} 
+is_selecting = false
+selection_start_x, selection_start_y = 0, 0
+selection_end_x, selection_end_y = 0, 0
+local last_click_time = 0
+local last_click_uid = nil
+hover_room = nil
+
+local TITLE_HEIGHT = 0
+
+AUTO_CENTER = (GetVariable("auto_center") ~= "0")
+
+-- ---------------------------------------------------------------------------
+--  Utility Functions
+-- ---------------------------------------------------------------------------
+
+-- Locates the correct path for database files, checking both root and plugin dirs.
+local function get_db_path(name)
+   local root = GetInfo(60) or ""
+   local plugins = GetInfo(66) or ""
+   
+   local function fix_path(p)
+      if p == "" then return "" end
+      if p:sub(-1) ~= "\\" and p:sub(-1) ~= "/" then
+         p = p .. "\\"
+      end
+      return p
+   end
+
+   local root_path = fix_path(root) .. name
+   local plugin_path = fix_path(plugins) .. name
+
+   -- Check root MUSHclient directory first
+   local f = io.open(root_path, "r")
+   if f then
+      local size = f:seek("end")
+      f:close()
+      if size > 0 then return root_path end
+   end
+
+   -- Check plugins directory second
+   local f2 = io.open(plugin_path, "r")
+   if f2 then
+      local size = f2:seek("end")
+      f2:close()
+      if size > 0 then return plugin_path end
+   end
+
+   return root_path
+end
+
+-- Initializes the miniwindow using the 'movewindow' library to recall position/size.
+-- Initializes the miniwindow.
+-- We use 'movewindow' to create standard drag handlers/hotspots, but we manually
+-- load/save the position and size to ensure our custom resizes persist correctly.
+function create_window()
+   -- Initialize movewindow handler helper (ignoring its config for pos/size)
+   -- Using 'false' for the auto-load argument to prevent it from overwriting our manual load
+   movewindow.install(win, miniwin.pos_top_right, miniwin.create_absolute_location, false)
+   
+   local grid_width = tonumber(GetVariable("width")) or 400
+   local grid_height = tonumber(GetVariable("height")) or 400
+   
+   local start_x = tonumber(GetVariable("window_left")) or 0
+   local start_y = tonumber(GetVariable("window_top")) or 0
+   
+   print(string.format("Grid Mapper: Loading Window - Pos: %d,%d Size: %dx%d", start_x, start_y, grid_width, grid_height))
+   
+   -- Basic window validation
+   if grid_width < 50 then grid_width = 400 end
+   if grid_height < 50 then grid_height = 400 end
+   
+   -- (Offsets of 0,0 are valid, so we don't treat them as 'uninitialized')
+
+   -- Update local windowinfo table
+   windowinfo = {
+      window_left = start_x,
+      window_top = start_y, 
+      window_mode = miniwin.pos_top_right, -- default fallback
+      window_flags = 2 -- absolute location
+   }
+
+   local bg_color = (Theme and Theme.PRIMARY_BODY) or 0x0c0c0c
+   local res = WindowCreate(win, windowinfo.window_left, windowinfo.window_top, grid_width, grid_height, windowinfo.create_absolute_location or 12, 2, bg_color)
+   
+   -- Register the single "background" hotspot that handles all mouse events
+   WindowDeleteHotspot(win, "background")
+   WindowAddHotspot(win, "background", 0, 0, grid_width, grid_height, 
+      "", "", "OnMouseDown", "OnMouseCancel", "OnMouseUp", 
+      "Drag rooms or the map. Scroll to zoom. Alt-Click or Double-click to speedwalk. Ctrl-Click for Info.", 
+      miniwin.cursor_arrow, 0)
+   WindowDragHandler(win, "background", "OnMouseMove", "OnMouseUp", 0)
+   WindowScrollwheelHandler(win, "background", "OnMouseWheel")
+   
+   -- Make sure to show the window if it was visible
+   if GRID_WINDOW_VISIBLE then
+       WindowShow(win, true)
+   end
+
+   return res
+end
+
+-- ---------------------------------------------------------------------------
+--  Plugin Initialization
+-- ---------------------------------------------------------------------------
+function OnPluginInstall()
+   create_window()
+   
+   local main_path = get_db_path("Aardwolf.db")
+   local pos_path = get_db_path("Aardwolf_Grid.db")
+   
+   print("Grid Mapper: Opening Main DB at " .. main_path)
+   main_db = sqlite3.open(main_path)
+   pos_db = sqlite3.open(pos_path)
+   
+   -- Ensure our custom position table exists
+   pos_db:exec([[
+      CREATE TABLE IF NOT EXISTS room_positions (
+         uid TEXT PRIMARY KEY,
+         area TEXT,
+         x REAL,
+         y REAL,
+         z REAL
+      );
+   ]])
+
+   -- Load terrain colors from the main Aardwolf DB
+   terrain_colours = {}
+   user_terrain_colour = {}
+   if main_db then
+      -- Check which tables exist (environments, terrain)
+      local tables = {}
+      local status = pcall(function()
+          for row in main_db:nrows("SELECT name FROM sqlite_master WHERE type='table'") do
+             tables[row.name:lower()] = true
+          end
+      end)
+
+      if tables["environments"] then
+         local env_count = 0
+         for row in main_db:nrows("SELECT * FROM environments") do
+            if row.name then
+               terrain_colours [tostring(row.name):lower()] = tonumber (row.color)
+               env_count = env_count + 1
+            end
+         end
+         print("Grid Mapper: Loaded " .. env_count .. " environment colors.")
+      end
+
+      if tables["terrain"] then
+         local user_count = 0
+         for row in main_db:nrows("SELECT * FROM terrain") do
+            if row.name then
+               user_terrain_colour [tostring(row.name):lower()] = row.color
+               user_count = user_count + 1
+            end
+         end
+         print("Grid Mapper: Loaded " .. user_count .. " user terrain colors.")
+      end
+   end
+   
+   load_known_rooms()
+
+   -- Apply saved font settings
+   user_font_name = GetVariable("user_font_name") or "Dina"
+   user_font_size = tonumber(GetVariable("user_font_size")) or 8
+   WindowFont(win, "f", user_font_name, user_font_size)
+   WindowFont(win, "title", user_font_name, user_font_size + 1, true)
+
+   local show = (GetVariable("window_visible") ~= "0")
+   GRID_WINDOW_VISIBLE = show
+   WindowShow(win, show)
+
+   AUTO_CENTER = (GetVariable("auto_center") ~= "0")
+
+   if IsConnected() then
+      Send_GMCP_Packet("request room")
+   end
+end
+
+function OnPluginSaveState()
+   -- Save Window State Manually to ensure it persists with custom resize
+   SetVariable("width", WindowInfo(win, 3) or 400)
+   SetVariable("height", WindowInfo(win, 4) or 400)
+   SetVariable("window_left", WindowInfo(win, 1) or 0)
+   SetVariable("window_top", WindowInfo(win, 2) or 0)
+   
+   -- Save Settings
+   SetVariable("user_font_name", user_font_name)
+   SetVariable("user_font_size", user_font_size)
+
+   SetVariable("scale", scale)
+   SetVariable("offset_x", offset_x)
+   SetVariable("offset_y", offset_y)
+   SetVariable("window_visible", (GRID_WINDOW_VISIBLE and "1") or "0")
+   SetVariable("auto_center", (AUTO_CENTER and "1") or "0")
+   SetVariable("room_size_factor", room_size_factor)
+   
+   -- print(string.format("Grid Mapper: Saving State... Size: %dx%d Pos: %d,%d Font: %s %d", 
+   --    GetVariable("width"), GetVariable("height"), GetVariable("window_left"), GetVariable("window_top"),
+   --    user_font_name, user_font_size))
+   -- We are doing manual saving now, so we skip movewindow.save_state to avoid conflicts.
+end
+
+-- ---------------------------------------------------------------------------
+--  GMCP / Protocol Handling
+-- ---------------------------------------------------------------------------
+function Send_GMCP_Packet(packet)
+   CallPlugin("3e7dedbe37e44942dd46d264", "Send_GMCP_Packet", packet)
+end
+
+-- Receives GMCP updates (Room Info) from the main Aardwolf MUSHclient plugin.
+-- This is where we detect room changes, area changes, and new room data.
+function OnPluginBroadcast(msg, id, name, text)
+   if id == "3e7dedbe37e44942dd46d264" then -- gmcphandler
+      if text == "room.info" then
+         local res, gmcparg = CallPlugin("3e7dedbe37e44942dd46d264", "gmcpval", "room.info")
+         if res == 0 and gmcparg and gmcparg ~= "" then
+            local ok, err = pcall(loadstring("gmcpdata = " .. gmcparg))
+            if ok then
+               local old_area = current_area
+                current_room = tostring(gmcpdata.num or "")
+                current_area = gmcpdata.zone
+                
+                if rooms[current_room] then
+                    rooms[current_room].terrain = gmcpdata.terrain or rooms[current_room].terrain
+                    rooms[current_room].info = gmcpdata.details or gmcpdata.info or rooms[current_room].info
+                else
+                    rooms[current_room] = {
+                        uid = current_room,
+                        name = gmcpdata.name,
+                        area = current_area,
+                        terrain = gmcpdata.terrain,
+                        info = gmcpdata.details or gmcpdata.info,
+                        exits = {}
+                    }
+                end
+
+                if current_area and current_area ~= old_area then
+                  load_area(current_area)
+                  auto_center()
+               end
+               if GRID_WINDOW_VISIBLE then
+                   draw_map()
+               end
+            end
+         end
+      end
+   end
+end
+
+-- ---------------------------------------------------------------------------
+--  Debug Utilities
+-- ---------------------------------------------------------------------------
+function gridmapper_debug()
+   print("--- Grid Mapper Debug ---")
+   print("Window ID: ", win)
+   print("Current Room: ", current_room or "nil")
+   print("Current Area: ", current_area or "nil")
+   if current_room and rooms[current_room] then
+      print("Current Room Terrain: ", rooms[current_room].terrain or "nil")
+      print("Current Room Info: ", rooms[current_room].info or "nil")
+   end
+   print("Scale: ", scale)
+   print("Room Size Factor: ", room_size_factor)
+   print("Offset: ", offset_x, offset_y)
+   print("Rooms Loaded: ", table.count(rooms))
+   print("Positions Loaded: ", table.count(room_positions))
+   print("Main DB Path: ", get_db_path("Aardwolf.db"))
+   print("Terrain Colours Loaded: ", table.count(terrain_colours))
+end
+
+function table.count(t)
+   local c = 0
+   for _ in pairs(t) do c = c + 1 end
+   return c
+end
+
+-- Refresh the 'known_rooms' cache for determining if an exit stub is unexplored or just distant.
+function load_known_rooms()
+   known_rooms = {}
+   if not main_db then return end
+   for row in main_db:nrows("SELECT uid FROM rooms") do
+      known_rooms[tostring(row.uid)] = true
+   end
+end
+
+-- ---------------------------------------------------------------------------
+--  Area Loading & Layout
+-- ---------------------------------------------------------------------------
+
+-- Loads all rooms, connections, and coordinates for a given Area UID.
+-- If no custom positions exist (unvisited area), it triggers a fresh BFS layout.
+function load_area(area_uid)
+   rooms = {}
+   room_positions = {}
+   
+   if not main_db then return end
+
+   -- 1. Load basic room info (name, terrain, etc.)
+   local stmt = main_db:prepare("SELECT uid, name, area, terrain, info FROM rooms WHERE area = ?")
+   if not stmt then
+       return
+   end
+   stmt:bind_values(area_uid)
+   local count = 0
+   for row in stmt:nrows() do
+      rooms[row.uid] = {
+         uid = row.uid,
+         name = row.name,
+         area = row.area,
+         terrain = row.terrain,
+         info = row.info,
+         exits = {}
+      }
+      count = count + 1
+   end
+   stmt:finalize()
+   print("Grid Mapper: Loaded " .. count .. " rooms for area " .. area_uid)
+
+   -- Look up full area name
+   current_area_name = area_uid
+   local stmt_area = main_db:prepare("SELECT name FROM areas WHERE uid = ?")
+   if stmt_area then
+      stmt_area:bind_values(area_uid)
+      if stmt_area:step() == sqlite3.ROW then
+         current_area_name = stmt_area:get_value(0)
+      end
+      stmt_area:finalize()
+   end
+   
+   -- 2. Load Exits (topology)
+   local stmt_exits = main_db:prepare([[
+      SELECT fromuid, touid, dir FROM exits 
+      WHERE fromuid IN (SELECT uid FROM rooms WHERE area = ?)
+   ]])
+   if stmt_exits then
+      stmt_exits:bind_values(area_uid)
+      for row in stmt_exits:nrows() do
+         if rooms[row.fromuid] then
+            rooms[row.fromuid].exits[row.dir] = row.touid
+         end
+      end
+      stmt_exits:finalize()
+   end
+   
+   -- 3. Load Custom Coordinates
+   local stmt_pos = pos_db:prepare("SELECT uid, x, y, z FROM room_positions WHERE area = ?")
+   if stmt_pos then
+      stmt_pos:bind_values(area_uid)
+      for row in stmt_pos:nrows() do
+         room_positions[row.uid] = {x = row.x, y = row.y, z = row.z}
+      end
+      stmt_pos:finalize()
+   end
+   
+   -- 4. If no positions loaded, run initial layout
+   local has_positions = false
+   for _ in pairs(room_positions) do has_positions = true break end
+   if not has_positions and current_room and rooms[current_room] then
+      do_bfs_layout(current_room)
+   end
+   load_known_rooms() -- Refresh global cache as well
+end
+
+-- Breadth-First Search Layout Algorithm
+-- Assigns integer coordinates to rooms starting from a seed room (0,0,0).
+function do_bfs_layout(start_uid)
+   local queue = {{uid = start_uid, x = 0, y = 0, z = 0}}
+   room_positions[start_uid] = {x = 0, y = 0, z = 0}
+   local visited = {[start_uid] = true}
+   local head = 1
+   local dir_offsets = {
+      n = {x = 0, y = -1, z = 0}, s = {x = 0, y = 1, z = 0},
+      e = {x = 1, y = 0, z = 0}, w = {x = -1, y = 0, z = 0},
+      u = {x = 0, y = 0, z = 1}, d = {x = 0, y = 0, z = -1},
+      ne = {x = 1, y = -1, z = 0}, nw = {x = -1, y = -1, z = 0},
+      se = {x = 1, y = 1, z = 0}, sw = {x = -1, y = 1, z = 0}
+   }
+   while head <= #queue do
+      local curr = queue[head]
+      head = head + 1
+      local room = rooms[curr.uid]
+      if room then
+         for dir, touid in pairs(room.exits) do
+            if rooms[touid] and not visited[touid] then
+               local off = dir_offsets[dir] or {x = 0, y = 0, z = 0}
+               local next_pos = {x = curr.x + off.x, y = curr.y + off.y, z = curr.z + (off.z or 0)}
+               room_positions[touid] = next_pos
+               visited[touid] = true
+               table.insert(queue, {uid = touid, x = next_pos.x, y = next_pos.y, z = next_pos.z})
+            end
+         end
+      end
+   end
+   save_all_positions()
+end
+
+function save_all_positions()
+   pos_db:exec("BEGIN TRANSACTION")
+   local stmt = pos_db:prepare("REPLACE INTO room_positions (uid, area, x, y, z) VALUES (?, ?, ?, ?, ?)")
+   for uid, pos in pairs(room_positions) do
+      stmt:bind_values(uid, current_area, pos.x, pos.y, pos.z)
+      stmt:step()
+      stmt:reset()
+   end
+   stmt:finalize()
+   pos_db:exec("COMMIT")
+end
+
+function save_room_position(uid)
+   local pos = room_positions[uid]
+   if not pos then return end
+   local stmt = pos_db:prepare("REPLACE INTO room_positions (uid, area, x, y, z) VALUES (?, ?, ?, ?, ?)")
+   stmt:bind_values(uid, current_area, pos.x, pos.y, pos.z)
+   stmt:step()
+   stmt:finalize()
+ end
+ 
+ function auto_center()
+    if not current_room or not room_positions[current_room] then return end
+    local pos = room_positions[current_room]
+    local win_w = WindowInfo(win, 3) or 400
+    local win_h = WindowInfo(win, 4) or 400
+    offset_x = (win_w / 2) - (pos.x * scale)
+    offset_y = (win_h / 2) - (pos.y * scale)
+ end
+ 
+-- ---------------------------------------------------------------------------
+ --  Map Rendering
+ -- ---------------------------------------------------------------------------
+ function draw_map()
+    if WindowInfo(win, 3) == nil then create_window() end
+    if AUTO_CENTER then auto_center() end
+    local win_w, win_h = WindowInfo(win, 3), WindowInfo(win, 4)
+    local bg_color = (Theme and Theme.PRIMARY_BODY) or 0x0c0c0c
+    WindowRectOp(win, 2, 0, 0, 0, 0, bg_color)
+    room_rects = {}
+    
+    -- Pre-calculate room counts at each coordinate for "stacked" indicators (per Z-level)
+    local pos_counts = {}
+    for _, pos in pairs(room_positions) do
+       local gx, gy = math.floor(pos.x * 2 + 0.5) / 2, math.floor(pos.y * 2 + 0.5) / 2
+       local key = string.format("%d:%.1f,%.1f", pos.z or 0, gx, gy)
+       pos_counts[key] = (pos_counts[key] or 0) + 1
+    end
+    
+    local current_pos = room_positions[current_room]
+    local current_z = current_pos and current_pos.z or 0
+    local room_size = math.max(4, math.floor(scale * room_size_factor))
+    local half_room = room_size / 2
+    
+    -- PHASE 1: Draw Exit Connections (Under Rooms)
+    -- We loop through all rooms and draw lines to neighbors on the same Z-level.
+    -- Lines are clipped to the approximate window bounds for performance.
+    for uid, pos in pairs(room_positions) do
+       if pos.z == current_z then
+          local room = rooms[uid]
+          if room then
+             local x1, y1 = pos.x * scale + offset_x, pos.y * scale + offset_y
+             for dir, touid in pairs(room.exits) do
+                local to_pos = room_positions[touid]
+                if to_pos then
+                   if to_pos.z == current_z then
+                      local x2, y2 = to_pos.x * scale + offset_x, to_pos.y * scale + offset_y
+                      -- Only draw lines that might be visible
+                      if (x1 > -100 or x2 > -100) and (x1 < win_w + 100 or x2 < win_w + 100) and
+                         (y1 > -100 or y2 > -100) and (y1 < win_h + 100 or y2 < win_h + 100) then
+                         WindowLine(win, x1, y1, x2, y2, 0x555555, 0, 1)
+                      end
+                   end
+                end
+             end
+          end
+       end
+    end
+    
+    -- PHASE 2: Draw Rooms (Nodes)
+    for uid, pos in pairs(room_positions) do
+       if pos.z == current_z then
+          local x, y = pos.x * scale + offset_x, pos.y * scale + offset_y
+          local is_current = (uid == current_room)
+          
+          -- Visibility Check
+          if x > -room_size and x < win_w + room_size and y > -room_size and y < win_h + room_size then
+             local left, top = math.floor(x - half_room), math.floor(y - half_room)
+             local right, bottom = math.floor(x + half_room), math.floor(y + half_room)
+             
+             local key = string.format("%d:%.1f,%.1f", pos.z or 0, pos.x, pos.y)
+             local is_stacked = (pos_counts[key] or 0) > 1
+             local room = rooms[uid]
+             local fill_color = bg_color
+             local border_color = is_current and 0xFF1493 or 0xAAAAAA
+             
+             if selected_rooms[uid] then
+                border_color = 0x00FFFF -- Yellow
+             end
+    
+             if room then
+                -- Special Color Overrides
+                if room.info then
+                   local info = tostring(room.info):lower()
+                   if info:find("shop") then fill_color = SPECIAL_COLORS.shop
+                   elseif info:find("healer") then fill_color = SPECIAL_COLORS.healer
+                   elseif info:find("guild") then fill_color = SPECIAL_COLORS.guild
+                   elseif info:find("trainer") then fill_color = SPECIAL_COLORS.trainer
+                   elseif info:find("questor") then fill_color = SPECIAL_COLORS.questor
+                   elseif info:find("bank") then fill_color = SPECIAL_COLORS.bank
+                   elseif info:find("safe") then fill_color = SPECIAL_COLORS.safe
+                   end
+                   
+                   if info:find("pk") and not is_current then
+                      border_color = PK_COLOR
+                   end
+                end
+                
+                -- If no special fill color yet, use terrain
+                if fill_color == bg_color and room.terrain then
+                   local t_name = tostring(room.terrain):lower()
+                   if user_terrain_colour[t_name] then fill_color = user_terrain_colour[t_name]
+                   elseif terrain_colours[t_name] then fill_color = colour_lookup[terrain_colours[t_name]] or bg_color end
+                end
+             end
+    
+             -- CRITICAL FIX for Color Banding:
+             -- Clamping correctly ensuring rr > rl and rb > rt
+             local rl, rt, rr, rb = left, top, right, bottom
+             if rl < 0 then rl = 0 end
+             if rt < 0 then rt = 0 end
+             if rr > win_w then rr = win_w end
+             if rb > win_h then rb = win_h end
+             
+             if rr > rl and rb > rt then
+                WindowRectOp(win, 2, rl, rt, rr, rb, fill_color)
+             end
+             
+             -- Draw border (lines are fine with off-screen coords in MUSHclient)
+             local b_width = (is_stacked and not is_current) and 2 or 1
+             WindowLine(win, left, top, right, top, border_color, 0, b_width)
+             WindowLine(win, left, bottom, right, bottom, border_color, 0, b_width)
+             WindowLine(win, left, top, left, bottom, border_color, 0, b_width)
+             WindowLine(win, right, top, right, bottom, border_color, 0, b_width)
+             
+             if is_stacked then
+                -- Extra "stacked" visual: small offset lines to the top-right
+                local offset = math.max(1, math.floor(room_size / 6))
+                WindowLine(win, right, top - offset, right + offset, top - offset, border_color, 0, 1)
+                WindowLine(win, right + offset, top - offset, right + offset, bottom - offset, border_color, 0, 1)
+             end
+             
+             if is_current then
+                for i = 1, 2 do
+                   WindowLine(win, left-i, top-i, right+i, top-i, border_color, 0, 1)
+                   WindowLine(win, left-i, bottom+i, right+i, bottom+i, border_color, 0, 1)
+                   WindowLine(win, left-i, top-i, left-i, bottom+i, border_color, 0, 1)
+                   WindowLine(win, right+i, top-i, right+i, bottom+i, border_color, 0, 1)
+                end
+             end
+             room_rects[uid] = {left = left, top = top, right = right, bottom = bottom}
+             if selected_rooms[uid] and not is_current then
+                for i = 1, 1 do
+                   WindowLine(win, left-i, top-i, right+i, top-i, 0x00FFFF, 0, 1)
+                   WindowLine(win, left-i, bottom+i, right+i, bottom+i, 0x00FFFF, 0, 1)
+                   WindowLine(win, left-i, top-i, left-i, bottom+i, 0x00FFFF, 0, 1)
+                   WindowLine(win, right+i, top-i, right+i, bottom+i, 0x00FFFF, 0, 1)
+                end
+             end
+          end
+       end
+    end
+    
+    -- Third Pass: Exit Stubs (drawn over rooms so they aren't covered)
+    for uid, pos in pairs(room_positions) do
+       if pos.z == current_z then
+          local x, y = pos.x * scale + offset_x, pos.y * scale + offset_y
+          -- Only process if reasonably near visible area
+          if x > -50 and x < win_w + 50 and y > -50 and y < win_h + 50 then
+             local room = rooms[uid]
+             if room then
+                for dir, touid in pairs(room.exits) do
+                   local to_pos = room_positions[touid]
+                   local touid_str = tostring(touid)
+                   
+                   -- Draw stub if target is in another area, another Z-level, or unexplored
+                   if not to_pos or to_pos.z ~= current_z then
+                      -- Color logic: If the room exists in the global DB, it's known (Gray).
+                      -- If it doesn't exist anywhere in the DB yet, it's unexplored (Red).
+                      local stub_color = known_rooms[touid_str] and 0xCCCCCC or 0x0000FF
+                      
+                      local off = ({
+                        n={0,-1}, s={0,1}, e={1,0}, w={-1,0}, 
+                        u={0.8,-0.8}, d={-0.8,0.8}, 
+                        ne={1,-1}, nw={-1,-1}, se={1,1}, sw={-1,1}
+                      })[dir]
+                      
+                      if off then
+                         -- Calculate the starting point exactly at the edge of the room box
+                         local max_off = math.max(math.abs(off[1]), math.abs(off[2]))
+                         local edge_mult = 1.0 / max_off
+                         
+                         local x1_stub = x + off[1] * half_room * edge_mult
+                         local y1_stub = y + off[2] * half_room * edge_mult
+                         
+                         -- The end point should be further out from the edge
+                         -- Using a fixed length relative to room size ensures it clearly exits the box
+                         local x2_stub = x1_stub + off[1] * half_room * 1.2
+                         local y2_stub = y1_stub + off[2] * half_room * 1.2
+                         
+                         WindowLine(win, x1_stub, y1_stub, x2_stub, y2_stub, stub_color, 0, 1)
+                      end
+                   end
+                end
+             end
+          end
+       end
+    end
+    
+    -- Extra Pass: Room Tooltip (Ctrl-Click)
+    if hover_room then
+       local room = rooms[hover_room]
+       local pos = room_positions[hover_room]
+       if room and pos then
+          local x, y = pos.x * scale + offset_x, pos.y * scale + offset_y
+          local exits = {}
+          for d in pairs(room.exits) do table.insert(exits, d) end
+          table.sort(exits)
+          
+          local info_lines = {
+             {text = room.name, font = "title", color = 0x000000},
+             {text = "Exits: " .. table.concat(exits, ", "), font = "f", color = 0x000000},
+             {text = "Room: " .. room.uid, font = "f", color = 0x000000},
+             {text = "Area: " .. (room.area or current_area or "Unknown"), font = "f", color = 0x000000},
+             {text = "Terrain: " .. (room.terrain or "None"), font = "f", color = 0x000000}
+          }
+          
+          local max_w = 0
+          local total_h = 4 -- padding
+          for _, line in ipairs(info_lines) do
+             max_w = math.max(max_w, WindowTextWidth(win, line.font, line.text))
+             total_h = total_h + WindowFontInfo(win, line.font, 1)
+          end
+          max_w = max_w + 10 -- padding
+          
+          local box_l = x + half_room + 5
+          local box_t = y - total_h / 2
+          
+          -- Boundary checks
+          if box_l + max_w > win_w then box_l = x - half_room - max_w - 5 end
+          local tool_t = box_t
+          if tool_t < TITLE_HEIGHT then tool_t = TITLE_HEIGHT + 5 end
+          if tool_t + total_h > win_h then tool_t = win_h - total_h - 5 end
+          
+          WindowRectOp(win, 2, box_l, tool_t, box_l + max_w, tool_t + total_h, 0xD2FFFF) -- Creamy background
+          WindowRectOp(win, 1, box_l, tool_t, box_l + max_w, tool_t + total_h, 0x000000) -- Border
+          
+          local curr_y = tool_t + 2
+          for _, line in ipairs(info_lines) do
+             WindowText(win, line.font, line.text, box_l + 5, curr_y, 0, 0, line.color)
+             curr_y = curr_y + WindowFontInfo(win, line.font, 1)
+          end
+       end
+    end
+    
+    if is_selecting then
+       local x1, y1 = selection_start_x, selection_start_y
+       local x2, y2 = selection_end_x, selection_end_y
+       WindowRectOp(win, 1, x1, y1, x2, y2, 0x00FFFF) -- Selection box frame
+       WindowRectOp(win, 2, x1, y1, x2, y2, 0x00FFFF, 0x000005) -- Slight tint
+    end
+    
+    if Theme and Theme.DressWindow then
+       local room_name = (current_room and rooms[current_room] and rooms[current_room].name) or "Grid Mapper"
+       local _, t = Theme.DressWindow(win, "title", room_name, "center")
+       TITLE_HEIGHT = t
+    end
+
+    -- Area name box at bottom
+    if current_area then
+       local area_text = current_area_name or current_area
+       local font = "f"
+       local tw = WindowTextWidth(win, font, area_text)
+       local th = WindowFontInfo(win, font, 1)
+       local box_w = tw + 10
+       local box_h = th + 4
+       local box_x = (win_w - box_w) / 2
+       local box_y = win_h - box_h - 2
+       
+       WindowRectOp(win, 2, box_x, box_y, box_x + box_w, box_y + box_h, 0x444444) -- Dark grey background
+       WindowRectOp(win, 1, box_x, box_y, box_x + box_w, box_y + box_h, 0x000000) -- Border
+       WindowText(win, font, area_text, box_x + 5, box_y + 2, 0, 0, 0xFFFFFF) -- White text
+    end
+    WindowMoveHotspot(win, "background", 0, TITLE_HEIGHT, win_w, win_h)
+    local title_hotspot = "title_drag_zoom"
+    if WindowHotspotInfo(win, title_hotspot, 1) == nil then
+       WindowAddHotspot(win, title_hotspot, 0, 0, win_w, TITLE_HEIGHT, "mw_" .. win .. "_movewindow_info.mouseover", "mw_" .. win .. "_movewindow_info.cancelmouseover", "mw_" .. win .. "_movewindow_info.mousedown", "mw_" .. win .. "_movewindow_info.cancelmousedown", "mw_" .. win .. "_movewindow_info.mouseup", "Drag title to move window. Scroll to zoom.", miniwin.cursor_both_arrow, 0)
+       WindowDragHandler(win, title_hotspot, "mw_" .. win .. "_movewindow_info.dragmove", "mw_" .. win .. "_movewindow_info.dragrelease", 0)
+       WindowScrollwheelHandler(win, title_hotspot, "OnMouseWheel")
+    else WindowMoveHotspot(win, title_hotspot, 0, 0, win_w, TITLE_HEIGHT) end
+    if Theme and Theme.AddResizeTag then Theme.AddResizeTag(win, 1, nil, nil, "resize_mouse_down", "resize_move_callback", "resize_release_callback") end
+    CallPlugin("abc1a0944ae4af7586ce88dc", "BufferedRepaint")
+ end
+ 
+ function resize_mouse_down(flags, hotspot_id) start_resize_x, start_resize_y = WindowInfo(win, 17), WindowInfo(win, 18) end
+ function resize_move_callback()
+    local posx, posy = WindowInfo(win, 17), WindowInfo(win, 18)
+    local width, height = math.max(100, WindowInfo(win, 3) + posx - start_resize_x), math.max(100, WindowInfo(win, 4) + posy - start_resize_y)
+    start_resize_x, start_resize_y = posx, posy
+    WindowResize(win, width, height, (Theme and Theme.PRIMARY_BODY) or 0x0c0c0c)
+    draw_map()
+ end
+ -- Called when the resize drag interaction finishes.
+ function resize_release_callback() 
+    OnPluginSaveState() 
+ end
+  function OnMouseDown(flags, hotspot_id)
+     local x, y = WindowInfo(win, 14), WindowInfo(win, 15)
+     last_mouse_x, last_mouse_y = x, y
+     if dragging_room or dragging_map then return end
+     
+     local clicked_room = nil
+     for uid, rect in pairs(room_rects) do 
+        if x >= rect.left and x <= rect.right and y >= rect.top and y <= rect.bottom then 
+           clicked_room = uid 
+           break 
+        end 
+     end
+
+     -- Alt-Click to speedwalk
+     local is_alt = bit.band(flags, ALT) ~= 0
+     if is_alt and clicked_room then
+        Execute("mapper goto " .. clicked_room)
+        return
+     end
+
+     -- Control-Click for info box
+     local is_control = bit.band(flags, CONTROL) ~= 0
+     if is_control then
+        if clicked_room then
+           hover_room = (hover_room == clicked_room) and nil or clicked_room
+        else
+           hover_room = nil
+        end
+        draw_map()
+        return
+     else
+        -- Regular click dismisses the hover dialog
+        if hover_room then
+           hover_room = nil
+           draw_map()
+        end
+     end
+
+     -- Custom Double-click detection
+     local now = utils.timer()
+     local clicked_uid_str = clicked_room and tostring(clicked_room) or nil
+     if clicked_uid_str and clicked_uid_str == last_click_uid and (now - last_click_time) < 0.4 then
+        Execute("mapper goto " .. clicked_uid_str)
+        last_click_uid = nil -- reset
+        return
+     end
+     last_click_time = now
+     last_click_uid = clicked_uid_str
+    
+    local is_shift = bit.band(flags, SHIFT) ~= 0
+    if is_shift then
+       is_selecting = true
+       selection_start_x, selection_start_y = x, y
+       selection_end_x, selection_end_y = x, y
+       draw_map()
+       return
+    end
+
+    if clicked_room then
+       if not selected_rooms[clicked_room] then
+          selected_rooms = {}
+          selected_rooms[clicked_room] = true
+       end
+       dragging_room = clicked_room
+    else
+       selected_rooms = {}
+       dragging_map = true
+    end
+    draw_map()
+ end
+ -- Handles dragging rooms, panning the map, or updating the selection rectangle.
+ function OnMouseMove(flags, hotspot_id)
+    local x, y = WindowInfo(win, 14), WindowInfo(win, 15)
+    local dx, dy = x - last_mouse_x, y - last_mouse_y
+    
+    if is_selecting then
+       -- Updating the visual selection box
+       selection_end_x, selection_end_y = x, y
+       draw_map()
+    elseif dragging_room then
+       -- Moving rooms (updating their custom coordinates)
+       for uid, _ in pairs(selected_rooms) do
+          local pos = room_positions[uid]
+          if pos then pos.x, pos.y = pos.x + (dx / scale), pos.y + (dy / scale) end
+       end
+       draw_map()
+    elseif dragging_map then 
+       -- Panning the view
+       AUTO_CENTER = false 
+       offset_x, offset_y = offset_x + dx, offset_y + dy 
+       draw_map() 
+    end
+    last_mouse_x, last_mouse_y = x, y
+ end
+ -- Finalizes drag operations and commits new room positions to the database.
+ function OnMouseUp(flags, hotspot_id)
+    if is_selecting then
+       is_selecting = false
+       local x1, x2 = math.min(selection_start_x, selection_end_x), math.max(selection_start_x, selection_end_x)
+       local y1, y2 = math.min(selection_start_y, selection_end_y), math.max(selection_start_y, selection_end_y)
+       
+       for uid, rect in pairs(room_rects) do
+          if rect.left <= x2 and rect.right >= x1 and rect.top <= y2 and rect.bottom >= y1 then
+             selected_rooms[uid] = true
+          end
+       end
+       draw_map()
+    elseif dragging_room then
+       for uid, _ in pairs(selected_rooms) do
+          local pos = room_positions[uid]
+          if pos then pos.x, pos.y = math.floor(pos.x * 2 + 0.5) / 2, math.floor(pos.y * 2 + 0.5) / 2 end
+          save_room_position(uid)
+       end
+       dragging_room = nil
+       draw_map()
+    end
+    dragging_map = false
+ end
+ function OnMouseCancel(flags, hotspot_id) dragging_room, dragging_map = nil, false end
+ function OnMouseWheel(flags, hotspot_id) if bit.band(flags, 0x100) ~= 0 then zoom_in() else zoom_out() end end
+ function zoom_in() if scale < 500 then scale = scale * 1.1 draw_map() end end
+ function zoom_out() if scale > 2 then scale = scale / 1.1 draw_map() end end
+ function reset_area_positions()
+    room_positions = {}
+    if current_room and rooms[current_room] then do_bfs_layout(current_room) end
+    auto_center()
+    draw_map()
+ end
+ ]]>
+ </script>
+ </muclient>
