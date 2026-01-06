@@ -209,6 +209,22 @@ require "gmcphelper"
 require "mw_theme_base"
 
 -- ---------------------------------------------------------------------------
+--  Direction Constants
+-- ---------------------------------------------------------------------------
+DIR_OFFSETS = {
+   n = {x = 0, y = -1, z = 0}, s = {x = 0, y = 1, z = 0},
+   e = {x = 1, y = 0, z = 0}, w = {x = -1, y = 0, z = 0},
+   u = {x = 0, y = 0, z = 1}, d = {x = 0, y = 0, z = -1},
+   ne = {x = 1, y = -1, z = 0}, nw = {x = -1, y = -1, z = 0},
+   se = {x = 1, y = 1, z = 0}, sw = {x = -1, y = 1, z = 0}
+}
+
+REVERSE_DIRS = {
+    n = "s", s = "n", e = "w", w = "e", u = "d", d = "u", 
+    ne = "sw", sw = "ne", nw = "se", se = "nw"
+}
+
+-- ---------------------------------------------------------------------------
 --  Global Variables & State
 -- ---------------------------------------------------------------------------
 GRID_WIN = GetPluginID()
@@ -500,28 +516,43 @@ function OnPluginBroadcast(msg, id, name, text)
          if res == 0 and gmcparg and gmcparg ~= "" then
             local ok, err = pcall(loadstring("gmcpdata = " .. gmcparg))
             if ok then
-               local old_area = current_area
-                current_room = tostring(gmcpdata.num or "")
-                current_area = gmcpdata.zone
-                
-                if rooms[current_room] then
-                    rooms[current_room].terrain = gmcpdata.terrain or rooms[current_room].terrain
-                    rooms[current_room].info = gmcpdata.details or gmcpdata.info or rooms[current_room].info
-                else
-                    rooms[current_room] = {
-                        uid = current_room,
-                        name = gmcpdata.name,
-                        area = current_area,
-                        terrain = gmcpdata.terrain,
-                        info = gmcpdata.details or gmcpdata.info,
-                        exits = {}
-                    }
-                end
+                local old_room = current_room
+                 local old_area = current_area -- Capture previous area before update
+                 current_room = tostring(gmcpdata.num or "")
+                 current_area = gmcpdata.zone
+                 
+                 -- 1. Handle Area Change FIRST
+                 -- If we moved to a new area, load its map data immediately.
+                 -- This ensures `rooms` and `room_positions` align with the new area.
+                 if current_area and current_area ~= old_area then
+                   load_area(current_area)
+                   auto_center()
+                 end
 
-                if current_area and current_area ~= old_area then
-                  load_area(current_area)
-                  auto_center()
-               end
+                 -- 2. Update/Add Room Data
+                 -- Now that `rooms` contains the correct area's data, we update or add the current room.
+                 if rooms[current_room] then
+                     rooms[current_room].terrain = gmcpdata.terrain or rooms[current_room].terrain
+                     rooms[current_room].info = gmcpdata.details or gmcpdata.info or rooms[current_room].info
+                     rooms[current_room].exits = gmcpdata.exits or rooms[current_room].exits
+                 else
+                     rooms[current_room] = {
+                         uid = current_room,
+                         name = gmcpdata.name,
+                         area = current_area,
+                         terrain = gmcpdata.terrain,
+                         info = gmcpdata.details or gmcpdata.info,
+                         exits = gmcpdata.exits or {}
+                     }
+                 end
+                 
+                 -- 3. Position the Room
+                 -- Only tries to position relative to *current* area's known rooms.
+                 -- If we just switched areas, `room_positions` only has new area rooms, 
+                 -- so we won't accidentally link to the old area.
+                 if not room_positions[current_room] then
+                     fill_unpositioned_rooms()
+                 end
                if GRID_WINDOW_VISIBLE then
                    draw_map()
                end
@@ -570,6 +601,39 @@ end
 -- ---------------------------------------------------------------------------
 --  Area Loading & Layout
 -- ---------------------------------------------------------------------------
+
+-- Tries to find positions for rooms that are in 'rooms' but not 'room_positions'.
+-- Uses existing positioned neighbors to infer coordinates.
+function fill_unpositioned_rooms()
+   local changed = true
+   while changed do
+      changed = false
+      for uid, room in pairs(rooms) do
+         if not room_positions[uid] then
+             -- Check if any neighbor has a position
+             for dir, touid in pairs(room.exits) do
+                 if room_positions[touid] then
+                     local rdir = REVERSE_DIRS[dir]
+                     if rdir then
+                         local offset = DIR_OFFSETS[rdir]
+                         local neighbor_pos = room_positions[touid]
+                         local new_pos = {
+                             x = neighbor_pos.x + offset.x,
+                             y = neighbor_pos.y + offset.y,
+                             z = neighbor_pos.z + (offset.z or 0)
+                         }
+                         room_positions[uid] = new_pos
+                         save_room_position(uid)
+                         changed = true
+                         break -- Found a position for this room, move to next room
+                     end
+                 end
+             end
+         end
+      end
+   end
+end
+
 
 -- Loads all rooms, connections, and coordinates for a given Area UID.
 -- If no custom positions exist (unvisited area), it triggers a fresh BFS layout.
@@ -641,24 +705,19 @@ function load_area(area_uid)
    for _ in pairs(room_positions) do has_positions = true break end
    if not has_positions and current_room and rooms[current_room] then
       do_bfs_layout(current_room)
+   else
+      fill_unpositioned_rooms()
    end
    load_known_rooms() -- Refresh global cache as well
 end
 
--- Breadth-First Search Layout Algorithm
 -- Assigns integer coordinates to rooms starting from a seed room (0,0,0).
 function do_bfs_layout(start_uid)
    local queue = {{uid = start_uid, x = 0, y = 0, z = 0}}
    room_positions[start_uid] = {x = 0, y = 0, z = 0}
    local visited = {[start_uid] = true}
    local head = 1
-   local dir_offsets = {
-      n = {x = 0, y = -1, z = 0}, s = {x = 0, y = 1, z = 0},
-      e = {x = 1, y = 0, z = 0}, w = {x = -1, y = 0, z = 0},
-      u = {x = 0, y = 0, z = 1}, d = {x = 0, y = 0, z = -1},
-      ne = {x = 1, y = -1, z = 0}, nw = {x = -1, y = -1, z = 0},
-      se = {x = 1, y = 1, z = 0}, sw = {x = -1, y = 1, z = 0}
-   }
+   -- DIR_OFFSETS is now global
    while head <= #queue do
       local curr = queue[head]
       head = head + 1
@@ -666,7 +725,7 @@ function do_bfs_layout(start_uid)
       if room then
          for dir, touid in pairs(room.exits) do
             if rooms[touid] and not visited[touid] then
-               local off = dir_offsets[dir] or {x = 0, y = 0, z = 0}
+               local off = DIR_OFFSETS[dir] or {x = 0, y = 0, z = 0}
                local next_pos = {x = curr.x + off.x, y = curr.y + off.y, z = curr.z + (off.z or 0)}
                room_positions[touid] = next_pos
                visited[touid] = true
@@ -885,8 +944,8 @@ function save_room_position(uid)
                          
                          -- The end point should be further out from the edge
                          -- Using a fixed length relative to room size ensures it clearly exits the box
-                         local x2_stub = x1_stub + off[1] * half_room * 1.2
-                         local y2_stub = y1_stub + off[2] * half_room * 1.2
+                         local x2_stub = x1_stub + off[1] * half_room * 1.0
+                         local y2_stub = y1_stub + off[2] * half_room * 1.0
                          
                          WindowLine(win, x1_stub, y1_stub, x2_stub, y2_stub, stub_color, 0, 1)
                       end
