@@ -34,6 +34,20 @@ Allows dragging rooms to change their positions.
     end
   </send>
   </alias>
+
+   <alias
+    match="^gridmapper refresh$"
+    enabled="y"
+    regexp="y"
+    send_to="12"
+    sequence="100"
+   >
+   <send>
+      load_known_rooms()
+      draw_map()
+      print("Grid Mapper: refreshed known rooms and redrew map")
+   </send>
+   </alias>
   
   <alias
    match="^gridmapper reset$"
@@ -172,11 +186,75 @@ Allows dragging rooms to change their positions.
     ColourNote("silver", "", "  gridmapper roomsize <0.1-1.0>    - Set room size factor (default 0.5)")
     ColourNote("silver", "", "  gridmapper font                  - Choose font name and size")
     ColourNote("silver", "", "  gridmapper help                  - Show this help message")
+   ColourNote("silver", "", "  gridmapper purgezone <area>      - Remove stored grid positions for <area>")
     ColourNote("gray", "",   "  (Double-click or Alt-Click a room to speedwalk)")
     ColourNote("gray", "",   "  (Ctrl-Click a room to see info)")
     ColourNote("gray", "",   "  (Shift-Drag to select multiple rooms)")
   ]]></send>
   </alias>
+  <alias
+   match="^gridmapper purgezone (.*)$"
+   enabled="y"
+   regexp="y"
+   send_to="12"
+   sequence="100"
+  >
+  <send><![CDATA[
+    local area = "%1"
+    if not area or area == "" then
+       print("Grid Mapper: Usage: gridmapper purgezone <area_uid>")
+       return
+    end
+
+    -- Ask for confirmation using utils.msgbox fallback
+    local confirm = nil
+    if utils and utils.msgbox then
+       confirm = utils.msgbox("Are you sure you want to remove all stored grid positions for area '"..area.."'? This cannot be undone.", "Grid Mapper", "yesno", "?")
+       if confirm == "yes" then confirm = true else confirm = false end
+    elseif utils and utils.yesno then
+       confirm = utils.yesno("Are you sure you want to remove all stored grid positions for area '"..area.."'? This cannot be undone.")
+    else
+       -- Last resort: prompt in the main window (no GUI) and assume no
+       print("Grid Mapper: Confirmation unavailable. Aborting for safety.")
+       return
+    end
+    if not confirm then print("Grid Mapper: Aborted.") return end
+
+    -- Ensure pos_db is available; try to open if plugin hasn't initialized it yet
+    if not pos_db then
+       local pos_path = get_db_path("Aardwolf_Grid.db")
+       if not pos_path then
+          print("Grid Mapper: Position DB path not found.")
+          return
+       end
+       pos_db = sqlite3.open(pos_path)
+       if not pos_db then
+          print("Grid Mapper: Failed to open position DB at " .. tostring(pos_path))
+          return
+       end
+    end
+
+    -- Perform deletion
+    local stmt = pos_db:prepare("DELETE FROM room_positions WHERE area = ?")
+    if not stmt then
+       print("Grid Mapper: Failed to prepare delete statement.")
+       return
+    end
+    stmt:bind_values(area)
+    stmt:step()
+    stmt:finalize()
+    pos_db:exec("VACUUM")
+
+    -- If we are currently viewing the area, remove in-memory entries
+    if tostring(current_area) == area then
+       room_positions = {}
+       draw_map()
+    end
+
+    print("Grid Mapper: Removed stored positions for area '"..area.."'.")
+  ]]></send>
+  </alias>
+
 </aliases>
 
 <!-- ========================================================================= -->
@@ -231,8 +309,8 @@ GRID_WIN = GetPluginID()
 local win = GRID_WIN
 
 -- Database Handling
-local pos_db   -- SQLite DB for saving custom room coordinates
-local main_db  -- SQLite DB for reading Aardwolf world data
+pos_db = nil   -- SQLite DB for saving custom room coordinates
+main_db = nil  -- SQLite DB for reading Aardwolf world data
 
 -- Game State
 current_room = nil
@@ -242,7 +320,11 @@ current_area_name = nil -- Full text name of the area
 -- Map Data
 rooms = {}          -- Table of all room data in the current area
 room_positions = {} -- Table of {x,y,z} coordinates keyed by room UID
+area_rooms_cache = {}      -- Per-area in-memory cache of rooms (to preserve runtime fields)
+area_positions_cache = {}  -- Per-area in-memory cache of positions
 room_rects = {}     -- Hit-test rectangles for mouse interaction
+pending_missing_attempts = {} -- retry counters for areas with missing room data
+pending_missing_rooms = {} -- map area_uid -> array of missing room uids
 
 -- View Settings
 scale = tonumber(GetVariable("scale") or 30) or 30
@@ -422,6 +504,8 @@ function OnPluginInstall()
       );
    ]])
 
+   -- NOTE: Do not create a plugin-level known_rooms table here; known rooms are authoritative in main_db.
+
    -- Load terrain colors from the main Aardwolf DB
    terrain_colours = {}
    user_terrain_colour = {}
@@ -520,7 +604,19 @@ function OnPluginBroadcast(msg, id, name, text)
                  local old_area = current_area -- Capture previous area before update
                  current_room = tostring(gmcpdata.num or "")
                  current_area = gmcpdata.zone
+                 -- Use GMCP-provided full zone name immediately if available
+                 if gmcpdata.zone_name and gmcpdata.zone_name ~= "" then
+                    current_area_name = gmcpdata.zone_name
+                 end
                  
+                 -- Mark current room as known immediately (in-memory only)
+                 known_rooms[current_room] = true
+                 -- If we're about to change areas, persist the current area's in-memory rooms/positions into cache
+                 if old_area and current_area and current_area ~= old_area and rooms then
+                    area_rooms_cache[old_area] = rooms
+                    area_positions_cache[old_area] = room_positions
+                 end
+
                  -- 1. Handle Area Change FIRST
                  -- If we moved to a new area, load its map data immediately.
                  -- This ensures `rooms` and `room_positions` align with the new area.
@@ -551,7 +647,37 @@ function OnPluginBroadcast(msg, id, name, text)
                  -- If we just switched areas, `room_positions` only has new area rooms, 
                  -- so we won't accidentally link to the old area.
                  if not room_positions[current_room] then
-                     fill_unpositioned_rooms()
+                     -- Ensure the current room is positioned immediately so it is visible on first entry.
+                     local any_pos = false
+                     for _ in pairs(room_positions) do any_pos = true break end
+                     if not any_pos then
+                        -- Fresh area: seed current room at origin
+                        room_positions[tostring(current_room)] = {x = 0, y = 0, z = 0}
+                        save_room_position(current_room)
+                     else
+                        -- Try to infer from a neighboring room if possible
+                        local placed = false
+                        local r = rooms[current_room]
+                        if r and r.exits then
+                           for dir, touid in pairs(r.exits) do
+                              local nr = tostring(touid)
+                              if room_positions[nr] then
+                                 local rev = REVERSE_DIRS[dir]
+                                 if rev and DIR_OFFSETS[rev] then
+                                    local off = DIR_OFFSETS[rev]
+                                    local npos = room_positions[nr]
+                                    room_positions[tostring(current_room)] = {x = npos.x + off.x, y = npos.y + off.y, z = npos.z + (off.z or 0)}
+                                    save_room_position(current_room)
+                                    placed = true
+                                    break
+                                 end
+                              end
+                           end
+                        end
+                        if not placed then
+                           fill_unpositioned_rooms()
+                        end
+                     end
                  end
                if GRID_WINDOW_VISIBLE then
                    draw_map()
@@ -583,6 +709,9 @@ function gridmapper_debug()
    print("Terrain Colours Loaded: ", table.count(terrain_colours))
 end
 
+-- Schedule a deferred initial area load to avoid race with GMCP mapper
+-- Deferred initial load and progressive retries removed (DB issue fixed upstream)
+
 function table.count(t)
    local c = 0
    for _ in pairs(t) do c = c + 1 end
@@ -609,26 +738,27 @@ function fill_unpositioned_rooms()
    while changed do
       changed = false
       for uid, room in pairs(rooms) do
-         if not room_positions[uid] then
-             -- Check if any neighbor has a position
-             for dir, touid in pairs(room.exits) do
-                 if room_positions[touid] then
-                     local rdir = REVERSE_DIRS[dir]
-                     if rdir then
-                         local offset = DIR_OFFSETS[rdir]
-                         local neighbor_pos = room_positions[touid]
-                         local new_pos = {
-                             x = neighbor_pos.x + offset.x,
-                             y = neighbor_pos.y + offset.y,
-                             z = neighbor_pos.z + (offset.z or 0)
-                         }
-                         room_positions[uid] = new_pos
-                         save_room_position(uid)
-                         changed = true
-                         break -- Found a position for this room, move to next room
-                     end
-                 end
+       if not room_positions[uid] then
+          -- Check if any neighbor has a position
+          for dir, touid in pairs(room.exits) do
+             local touid_str = tostring(touid)
+             if room_positions[touid_str] then
+                local rdir = REVERSE_DIRS[dir]
+                if rdir then
+                   local offset = DIR_OFFSETS[rdir]
+                   local neighbor_pos = room_positions[touid_str]
+                   local new_pos = {
+                      x = neighbor_pos.x + offset.x,
+                      y = neighbor_pos.y + offset.y,
+                      z = neighbor_pos.z + (offset.z or 0)
+                   }
+                   room_positions[uid] = new_pos
+                   save_room_position(uid)
+                   changed = true
+                   break -- Found a position for this room, move to next room
+                end
              end
+          end
          end
       end
    end
@@ -638,8 +768,16 @@ end
 -- Loads all rooms, connections, and coordinates for a given Area UID.
 -- If no custom positions exist (unvisited area), it triggers a fresh BFS layout.
 function load_area(area_uid)
-   rooms = {}
-   room_positions = {}
+   local DEBUG_MERGE = false
+   local DEBUG_LOAD = true
+   -- If we have a cached copy for this area, reuse it to preserve runtime-updated fields.
+   if area_rooms_cache[area_uid] then
+      rooms = area_rooms_cache[area_uid]
+      room_positions = area_positions_cache[area_uid] or {}
+   else
+      rooms = {}
+      room_positions = {}
+   end
    
    if not main_db then return end
 
@@ -650,30 +788,62 @@ function load_area(area_uid)
    end
    stmt:bind_values(area_uid)
    local count = 0
-   for row in stmt:nrows() do
-      rooms[row.uid] = {
-         uid = row.uid,
-         name = row.name,
-         area = row.area,
-         terrain = row.terrain,
-         info = row.info,
-         exits = {}
-      }
+      for row in stmt:nrows() do
+      local ruid = tostring(row.uid)
+      if rooms[ruid] then
+         if DEBUG_MERGE then print(string.format("GridMapper: merging room %s (area %s)", ruid, area_uid)) end
+         -- Merge DB values into existing in-memory room (preserve runtime-updated fields)
+         rooms[ruid].name = row.name or rooms[ruid].name
+         rooms[ruid].area = row.area or rooms[ruid].area
+         rooms[ruid].terrain = row.terrain or rooms[ruid].terrain
+         rooms[ruid].info = row.info or rooms[ruid].info
+      else
+         if DEBUG_MERGE then print(string.format("GridMapper: creating room %s (area %s)", ruid, area_uid)) end
+         rooms[ruid] = {
+            uid = ruid,
+            name = row.name,
+            area = row.area,
+            terrain = row.terrain,
+            info = row.info,
+            exits = {}, 
+            cexits = {}
+         }
+         -- load-time debug output removed
+      end
       count = count + 1
    end
    stmt:finalize()
-   print("Grid Mapper: Loaded " .. count .. " rooms for area " .. area_uid)
+   -- load summary and missing-room retry scheduling suppressed
+   local missing = {}
+   for uid, room in pairs(rooms) do
+      if room.area == area_uid and (not room.terrain or room.terrain == "") then table.insert(missing, uid) end
+   end
+   if #missing > 0 then
+      pending_missing_rooms[area_uid] = pending_missing_rooms[area_uid] or {}
+      for _, m in ipairs(missing) do table.insert(pending_missing_rooms[area_uid], m) end
+      if not pending_missing_attempts[area_uid] then
+         pending_missing_attempts[area_uid] = 0
+         local flags = timer_flag.OneShot + timer_flag.Replace + timer_flag.Temporary + timer_flag.ActiveWhenClosed + timer_flag.Enabled
+         AddTimer("gm_missing_rooms_retry_150_" .. tostring(area_uid), 0, 0, 0.15, "", flags, "retry_missing_rooms_timer")
+         AddTimer("gm_missing_rooms_retry_500_" .. tostring(area_uid), 0, 0, 0.5, "", flags, "retry_missing_rooms_timer")
+      end
+   end
 
    -- Look up full area name
    current_area_name = area_uid
-   local stmt_area = main_db:prepare("SELECT name FROM areas WHERE uid = ?")
-   if stmt_area then
-      stmt_area:bind_values(area_uid)
-      if stmt_area:step() == sqlite3.ROW then
-         current_area_name = stmt_area:get_value(0)
+      local stmt_area = main_db:prepare("SELECT name FROM areas WHERE uid = ?")
+      if stmt_area then
+         stmt_area:bind_values(area_uid)
+         -- Use nrows iterator to safely retrieve text values
+         for row in stmt_area:nrows() do
+            if row.name and row.name ~= "" then
+               current_area_name = row.name
+               break
+            end
+         end
+         -- Area name resolved; no debug print in normal operation
+         stmt_area:finalize()
       end
-      stmt_area:finalize()
-   end
    
    -- 2. Load Exits (topology)
    local stmt_exits = main_db:prepare([[
@@ -690,32 +860,169 @@ function load_area(area_uid)
       stmt_exits:finalize()
    end
    
-   -- 3. Load Custom Coordinates
+   -- 3. Load Custom Exits (cexits)
+   local stmt_cexits = main_db:prepare([[
+      SELECT roomuid, dir, command FROM cexits 
+      WHERE roomuid IN (SELECT uid FROM rooms WHERE area = ?)
+   ]])
+   if stmt_cexits then
+      stmt_cexits:bind_values(area_uid)
+      local cexit_count = 0
+      for row in stmt_cexits:nrows() do
+         local ruid = tostring(row.roomuid)
+         if rooms[ruid] then
+             table.insert(rooms[ruid].cexits, {dir = row.dir, command = row.command})
+             cexit_count = cexit_count + 1
+         end
+      end
+      stmt_cexits:finalize()
+      print("Grid Mapper: Loaded " .. cexit_count .. " cexits for area " .. area_uid)
+   end
+
+   -- 4. Load Custom Coordinates
    local stmt_pos = pos_db:prepare("SELECT uid, x, y, z FROM room_positions WHERE area = ?")
    if stmt_pos then
       stmt_pos:bind_values(area_uid)
       for row in stmt_pos:nrows() do
-         room_positions[row.uid] = {x = row.x, y = row.y, z = row.z}
-      end
+            room_positions[tostring(row.uid)] = {x = row.x, y = row.y, z = row.z}
+         end
       stmt_pos:finalize()
    end
    
-   -- 4. If no positions loaded, run initial layout
-   local has_positions = false
-   for _ in pairs(room_positions) do has_positions = true break end
-   if not has_positions and current_room and rooms[current_room] then
-      do_bfs_layout(current_room)
-   else
-      fill_unpositioned_rooms()
+    -- 5. If no positions loaded, run initial layout
+    local has_positions = false
+    for _ in pairs(room_positions) do has_positions = true break end
+    if not has_positions and current_room and rooms[current_room] then
+       do_bfs_layout(current_room)
+    else
+       fill_unpositioned_rooms()
+    end
+    load_known_rooms() -- Refresh global cache as well
+   -- Schedule a one-shot retry for area name lookup to handle timing races where the DB row may appear shortly after load.
+   if area_uid then
+      -- AddTimer(name, hour, minute, second, "", flags, functionName)
+      -- Use small delay (0.15s) and OneShot + Replace + Temporary + ActiveWhenClosed
+      local flags = timer_flag.OneShot + timer_flag.Replace + timer_flag.Temporary + timer_flag.ActiveWhenClosed + timer_flag.Enabled
+      -- Unique timer name per area to avoid collisions
+      local tname = "gm_area_name_retry_" .. tostring(area_uid)
+      AddTimer(tname, 0, 0, 0.15, "", flags, "retry_area_name_timer")
    end
-   load_known_rooms() -- Refresh global cache as well
+ end
+
+-- Retry helper: re-query the areas table for a given uid and update the displayed name if it changed.
+function retry_area_name_lookup(area_uid)
+   if not main_db or not area_uid then return end
+   local stmt_area = main_db:prepare("SELECT name FROM areas WHERE uid = ?")
+   if not stmt_area then return end
+   stmt_area:bind_values(area_uid)
+   for row in stmt_area:nrows() do
+      if row.name and row.name ~= "" then
+         if current_area == area_uid and current_area_name ~= row.name then
+            current_area_name = row.name
+            draw_map()
+         end
+         break
+      end
+   end
+   stmt_area:finalize()
+end
+
+-- Timer wrapper called by AddTimer (timers call a function name with no args)
+function retry_area_name_timer()
+   local area = current_area
+   if not area then return end
+   -- Retry timer triggered; no debug print in normal operation
+   -- Ask main GMCP handler for area details which may populate the DB
+   Send_GMCP_Packet("request area")
+   Send_GMCP_Packet("request room")
+   -- Immediate attempt
+   retry_area_name_lookup(area)
+   -- Schedule two follow-up retries in case the DB is populated shortly after
+   local flags = timer_flag.OneShot + timer_flag.Replace + timer_flag.Temporary + timer_flag.ActiveWhenClosed + timer_flag.Enabled
+   AddTimer("gm_area_name_retry_again_150_" .. tostring(area), 0, 0, 0.15, "", flags, "retry_area_name_timer_helper")
+   AddTimer("gm_area_name_retry_again_500_" .. tostring(area), 0, 0, 0.5, "", flags, "retry_area_name_timer_helper")
+end
+
+function retry_area_name_timer_helper()
+   retry_area_name_lookup(current_area)
+end
+
+-- Timer wrapper to retry loading missing room data for an area
+function retry_missing_rooms_timer()
+   local area = current_area
+   if not area then return end
+   pending_missing_attempts[area] = (pending_missing_attempts[area] or 0) + 1
+   if pending_missing_attempts[area] > 12 then
+      -- Give up after some attempts
+      pending_missing_attempts[area] = nil
+      pending_missing_rooms[area] = nil
+      return
+   end
+   -- Query DB for the specific missing room UIDs and update in-memory rooms when available
+   local pend = pending_missing_rooms[area]
+   if not pend or #pend == 0 then
+      pending_missing_rooms[area] = nil
+      pending_missing_attempts[area] = nil
+      return
+   end
+   -- Build a param list to query multiple UIDs safely
+   local found_any = false
+   for i = #pend, 1, -1 do
+      local uid = pend[i]
+      if main_db then
+         local stmt = main_db:prepare("SELECT terrain, info FROM rooms WHERE uid = ? LIMIT 1")
+         if stmt then
+            stmt:bind_values(uid)
+            for row in stmt:nrows() do
+               if row.terrain and row.terrain ~= "" then
+                  if rooms[uid] then rooms[uid].terrain = row.terrain end
+                  if row.info and row.info ~= "" then if rooms[uid] then rooms[uid].info = row.info end end
+                  found_any = true
+                  table.remove(pend, i)
+               end
+            end
+            stmt:finalize()
+         end
+      end
+   end
+   if found_any then
+      draw_map()
+   end
+     -- If there are still pending rooms, print their current DB rows for diagnostics
+     if pending_missing_rooms[area] and #pending_missing_rooms[area] > 0 then
+        for _, uid in ipairs(pending_missing_rooms[area]) do
+           if main_db then
+              local stmt2 = main_db:prepare("SELECT uid, name, terrain, info FROM rooms WHERE uid = ? LIMIT 1")
+              if stmt2 then
+                 stmt2:bind_values(uid)
+                 for row in stmt2:nrows() do
+                    -- diagnostic removed
+                 end
+                 stmt2:finalize()
+                 else
+                    -- diagnostic removed
+                 end
+           else
+              -- diagnostic removed
+           end
+        end
+     end
+   -- Re-schedule another retry if there are still pending rooms
+   if pending_missing_rooms[area] and #pending_missing_rooms[area] > 0 then
+      local flags = timer_flag.OneShot + timer_flag.Replace + timer_flag.Temporary + timer_flag.ActiveWhenClosed + timer_flag.Enabled
+      AddTimer("gm_missing_rooms_retry_again_" .. tostring(area) .. "_" .. tostring(pending_missing_attempts[area]), 0, 0, 0.25, "", flags, "retry_missing_rooms_timer")
+   else
+      pending_missing_attempts[area] = nil
+      pending_missing_rooms[area] = nil
+   end
 end
 
 -- Assigns integer coordinates to rooms starting from a seed room (0,0,0).
 function do_bfs_layout(start_uid)
-   local queue = {{uid = start_uid, x = 0, y = 0, z = 0}}
-   room_positions[start_uid] = {x = 0, y = 0, z = 0}
-   local visited = {[start_uid] = true}
+   local start_uid_str = tostring(start_uid)
+   local queue = {{uid = start_uid_str, x = 0, y = 0, z = 0}}
+   room_positions[start_uid_str] = {x = 0, y = 0, z = 0}
+   local visited = {[start_uid_str] = true}
    local head = 1
    -- DIR_OFFSETS is now global
    while head <= #queue do
@@ -724,12 +1031,13 @@ function do_bfs_layout(start_uid)
       local room = rooms[curr.uid]
       if room then
          for dir, touid in pairs(room.exits) do
-            if rooms[touid] and not visited[touid] then
+            local touid_str = tostring(touid)
+            if rooms[touid_str] and not visited[touid_str] then
                local off = DIR_OFFSETS[dir] or {x = 0, y = 0, z = 0}
                local next_pos = {x = curr.x + off.x, y = curr.y + off.y, z = curr.z + (off.z or 0)}
-               room_positions[touid] = next_pos
-               visited[touid] = true
-               table.insert(queue, {uid = touid, x = next_pos.x, y = next_pos.y, z = next_pos.z})
+               room_positions[touid_str] = next_pos
+               visited[touid_str] = true
+               table.insert(queue, {uid = touid_str, x = next_pos.x, y = next_pos.y, z = next_pos.z})
             end
          end
       end
@@ -759,8 +1067,8 @@ function save_room_position(uid)
  end
  
  function auto_center()
-    if not current_room or not room_positions[current_room] then return end
-    local pos = room_positions[current_room]
+   if not current_room or not room_positions[tostring(current_room)] then return end
+   local pos = room_positions[tostring(current_room)]
     local win_w = WindowInfo(win, 3) or 400
     local win_h = WindowInfo(win, 4) or 400
     offset_x = (win_w / 2) - (pos.x * scale)
@@ -770,6 +1078,20 @@ function save_room_position(uid)
 -- ---------------------------------------------------------------------------
  --  Map Rendering
  -- ---------------------------------------------------------------------------
+
+ -- Check if a connection is reciprocal (two-way)
+ local function is_two_way(uid1, uid2)
+    -- If we don't have room data for the target, we can't confirm a return path.
+    -- Default to false (one-way) to be safe/conservative.
+    if not rooms[uid2] then return false end
+    if not rooms[uid2].exits then return false end
+    
+    for dir, target in pairs(rooms[uid2].exits) do
+       if target == uid1 then return true end
+    end
+    return false
+ end
+ 
  function draw_map()
     if WindowInfo(win, 3) == nil then create_window() end
     if AUTO_CENTER then auto_center() end
@@ -796,18 +1118,23 @@ function save_room_position(uid)
     -- Lines are clipped to the approximate window bounds for performance.
     for uid, pos in pairs(room_positions) do
        if pos.z == current_z then
-          local room = rooms[uid]
+          local uid_str = tostring(uid)
+          local room = rooms[uid_str]
           if room then
              local x1, y1 = pos.x * scale + offset_x, pos.y * scale + offset_y
              for dir, touid in pairs(room.exits) do
-                local to_pos = room_positions[touid]
+                local touid_str = tostring(touid)
+                local to_pos = room_positions[touid_str]
                 if to_pos then
                    if to_pos.z == current_z then
-                      local x2, y2 = to_pos.x * scale + offset_x, to_pos.y * scale + offset_y
-                      -- Only draw lines that might be visible
-                      if (x1 > -100 or x2 > -100) and (x1 < win_w + 100 or x2 < win_w + 100) and
-                         (y1 > -100 or y2 > -100) and (y1 < win_h + 100 or y2 < win_h + 100) then
-                         WindowLine(win, x1, y1, x2, y2, 0x555555, 0, 1)
+                      -- Only draw full connection lines if the exit is two-way
+                      if is_two_way(uid_str, touid_str) then
+                         local x2, y2 = to_pos.x * scale + offset_x, to_pos.y * scale + offset_y
+                         -- Only draw lines that might be visible
+                         if (x1 > -100 or x2 > -100) and (x1 < win_w + 100 or x2 < win_w + 100) and
+                            (y1 > -100 or y2 > -100) and (y1 < win_h + 100 or y2 < win_h + 100) then
+                            WindowLine(win, x1, y1, x2, y2, 0x555555, 0, 1)
+                         end
                       end
                    end
                 end
@@ -819,8 +1146,9 @@ function save_room_position(uid)
     -- PHASE 2: Draw Rooms (Nodes)
     for uid, pos in pairs(room_positions) do
        if pos.z == current_z then
+          local uid_str = tostring(uid)
           local x, y = pos.x * scale + offset_x, pos.y * scale + offset_y
-          local is_current = (uid == current_room)
+          local is_current = (uid_str == tostring(current_room))
           
           -- Visibility Check
           if x > -room_size and x < win_w + room_size and y > -room_size and y < win_h + room_size then
@@ -829,11 +1157,11 @@ function save_room_position(uid)
              
              local key = string.format("%d:%.1f,%.1f", pos.z or 0, pos.x, pos.y)
              local is_stacked = (pos_counts[key] or 0) > 1
-             local room = rooms[uid]
+             local room = rooms[uid_str]
              local fill_color = bg_color
              local border_color = is_current and 0xFF1493 or 0xAAAAAA
              
-             if selected_rooms[uid] then
+                   if selected_rooms[uid_str] then
                 border_color = 0x00FFFF -- Yellow
              end
     
@@ -888,6 +1216,40 @@ function save_room_position(uid)
                 WindowLine(win, right, top - offset, right + offset, top - offset, border_color, 0, 1)
                 WindowLine(win, right + offset, top - offset, right + offset, bottom - offset, border_color, 0, 1)
              end
+
+             -- Draw Cexits Visuals (only if we have a room object)
+             if room and room.cexits and #room.cexits > 0 then
+                 local has_special_cexit = false
+                 for _, cexit in ipairs(room.cexits) do
+                     -- Check for "open <dir>" pattern
+                     local open_dir = cexit.command:match("^open (%a+)")
+                     if open_dir then
+                         -- It's a door! Draw brown edge.
+                         -- Normalize direction just in case (e.g. "north" -> "n") - though usually short in Aard
+                         local d = open_dir:sub(1,1):lower() 
+                         -- Map 'ne', 'nw', etc if needed, but 'open n' is standard.
+                         
+                         local door_color = 0xA52A2A -- Brown
+                         local dw = 2 -- Door width
+                         
+                         if d == "n" then WindowLine(win, left+1, top, right-1, top, door_color, 0, dw)
+                         elseif d == "s" then WindowLine(win, left+1, bottom, right-1, bottom, door_color, 0, dw)
+                         elseif d == "e" then WindowLine(win, right, top+1, right, bottom-1, door_color, 0, dw)
+                         elseif d == "w" then WindowLine(win, left, top+1, left, bottom-1, door_color, 0, dw)
+                         -- Handle diagonals if needed, but less common for "open"
+                         end
+                     else
+                         has_special_cexit = true
+                     end
+                 end
+                 
+                 -- If there was any non-door cexit, draw the teal dot
+                 if has_special_cexit then
+                     local dot_size = math.max(2, math.floor(room_size / 4))
+                     local dot_color = 0x808000 -- Teal
+                     WindowRectOp(win, 2, right - dot_size - 1, top + 1, right - 1, top + dot_size + 1, dot_color)
+                 end
+             end
              
              if is_current then
                 for i = 1, 2 do
@@ -897,8 +1259,8 @@ function save_room_position(uid)
                    WindowLine(win, right+i, top-i, right+i, bottom+i, border_color, 0, 1)
                 end
              end
-             room_rects[uid] = {left = left, top = top, right = right, bottom = bottom}
-             if selected_rooms[uid] and not is_current then
+             room_rects[uid_str] = {left = left, top = top, right = right, bottom = bottom}
+             if selected_rooms[uid_str] and not is_current then
                 for i = 1, 1 do
                    WindowLine(win, left-i, top-i, right+i, top-i, 0x00FFFF, 0, 1)
                    WindowLine(win, left-i, bottom+i, right+i, bottom+i, 0x00FFFF, 0, 1)
@@ -913,20 +1275,24 @@ function save_room_position(uid)
     -- Third Pass: Exit Stubs (drawn over rooms so they aren't covered)
     for uid, pos in pairs(room_positions) do
        if pos.z == current_z then
+          local uid_str = tostring(uid)
           local x, y = pos.x * scale + offset_x, pos.y * scale + offset_y
           -- Only process if reasonably near visible area
           if x > -50 and x < win_w + 50 and y > -50 and y < win_h + 50 then
-             local room = rooms[uid]
+             local room = rooms[uid_str]
              if room then
                 for dir, touid in pairs(room.exits) do
-                   local to_pos = room_positions[touid]
                    local touid_str = tostring(touid)
+                   local to_pos = room_positions[touid_str]
                    
-                   -- Draw stub if target is in another area, another Z-level, or unexplored
-                   if not to_pos or to_pos.z ~= current_z then
+                   -- Draw stub if target is in another area, another Z-level, unexplored, OR one-way (no return path)
+                   if not to_pos or to_pos.z ~= current_z or not is_two_way(uid_str, touid_str) then
                       -- Color logic: If the room exists in the global DB, it's known (Gray).
-                      -- If it doesn't exist anywhere in the DB yet, it's unexplored (Red).
-                      local stub_color = known_rooms[touid_str] and 0xCCCCCC or 0x0000FF
+                      -- If it doesn't exist anywhere in the DB yet, it's unexplored (Blue).
+                      -- For one-way exits (no return path), use a distinct color (Orange) and draw an arrowhead.
+                      local is_two = is_two_way(uid_str, touid_str)
+                      -- Base stub color: known (gray) if we've seen the room before; otherwise unexplored (red).
+                      local base_stub_color = known_rooms[touid_str] and 0xCCCCCC or 0xFF0000
                       
                       local off = ({
                         n={0,-1}, s={0,1}, e={1,0}, w={-1,0}, 
@@ -947,7 +1313,28 @@ function save_room_position(uid)
                          local x2_stub = x1_stub + off[1] * half_room * 1.0
                          local y2_stub = y1_stub + off[2] * half_room * 1.0
                          
-                         WindowLine(win, x1_stub, y1_stub, x2_stub, y2_stub, stub_color, 0, 1)
+                         -- Draw the base stub line first
+                         WindowLine(win, x1_stub, y1_stub, x2_stub, y2_stub, base_stub_color, 0, 1)
+                         -- If this is a one-way exit (no return path) draw an arrowhead overlay,
+                         -- but only when we have room data for the target (avoid arrows for purely unexplored targets)
+                         if not is_two and rooms[touid_str] then
+                            -- Arrow color: orange for known one-way
+                            local arrow_color = ColourNameToRGB "#ff8c00"
+                            local asz = math.max(2, math.floor(room_size / 4))
+                            local dx, dy = off[1], off[2]
+                            local len = math.max(0.0001, math.sqrt(dx*dx + dy*dy))
+                            local nx, ny = dx / len, dy / len
+                            local px, py = -ny, nx
+                            local base_x = x2_stub - nx * asz
+                            local base_y = y2_stub - ny * asz
+                            local left_x = base_x + px * (asz/2)
+                            local left_y = base_y + py * (asz/2)
+                            local right_x = base_x - px * (asz/2)
+                            local right_y = base_y - py * (asz/2)
+                            WindowLine(win, x2_stub, y2_stub, left_x, left_y, arrow_color, 0, 1)
+                            WindowLine(win, x2_stub, y2_stub, right_x, right_y, arrow_color, 0, 1)
+                            WindowLine(win, left_x, left_y, right_x, right_y, arrow_color, 0, 1)
+                         end
                       end
                    end
                 end
@@ -958,8 +1345,9 @@ function save_room_position(uid)
     
     -- Extra Pass: Room Tooltip (Ctrl-Click)
     if hover_room then
-       local room = rooms[hover_room]
-       local pos = room_positions[hover_room]
+       local hover_id = tostring(hover_room)
+       local room = rooms[hover_id]
+       local pos = room_positions[hover_id]
        if room and pos then
           local x, y = pos.x * scale + offset_x, pos.y * scale + offset_y
           local exits = {}
