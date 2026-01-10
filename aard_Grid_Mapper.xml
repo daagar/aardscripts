@@ -36,6 +36,19 @@ Allows dragging rooms to change their positions.
   </alias>
 
    <alias
+    match="^gridmapper shift (.*)$"
+    enabled="y"
+    regexp="y"
+    send_to="12"
+    sequence="100"
+   >
+   <send><![CDATA[
+      local dir = "%1"
+      gridmapper_shift(dir)
+   ]]></send>
+   </alias>
+
+   <alias
     match="^gridmapper refresh$"
     enabled="y"
     regexp="y"
@@ -186,7 +199,8 @@ Allows dragging rooms to change their positions.
     ColourNote("silver", "", "  gridmapper roomsize <0.1-1.0>    - Set room size factor (default 0.5)")
     ColourNote("silver", "", "  gridmapper font                  - Choose font name and size")
     ColourNote("silver", "", "  gridmapper help                  - Show this help message")
-   ColourNote("silver", "", "  gridmapper purgezone <area>      - Remove stored grid positions for <area>")
+    ColourNote("silver", "", "  gridmapper shift <direction>     - Move current/selected room(s) one grid unit (n/s/e/w/u/d)")
+    ColourNote("silver", "", "  gridmapper purgezone <area>      - Remove stored grid positions for <area>")
     ColourNote("gray", "",   "  (Double-click or Alt-Click a room to speedwalk)")
     ColourNote("gray", "",   "  (Ctrl-Click a room to see info)")
     ColourNote("gray", "",   "  (Shift-Drag to select multiple rooms)")
@@ -1569,6 +1583,67 @@ function save_room_position(uid)
     auto_center()
     draw_map()
  end
+
+-- Shift the current room (or selected rooms) by one grid unit in the given direction.
+-- Accepts short or long directions, e.g. 'n'|'north', 's'|'south', 'e'|'east', 'w'|'west',
+-- 'u'|'up', 'd'|'down'. Also accepts bare single-letter like 'd' which may be ambiguous with 'down';
+-- we prefer matching full words first and fall back to single-letter mapping.
+function gridmapper_shift(dir_raw)
+   if not dir_raw or dir_raw == "" then
+      print("Grid Mapper: Usage: gridmapper shift <direction>")
+      return
+   end
+   local d = tostring(dir_raw):lower()
+   -- Reuse global DIR_OFFSETS where possible. Provide synonyms for long words.
+   local synonyms = {
+      north = 'n', south = 's', east = 'e', west = 'w',
+      northeast = 'ne', northwest = 'nw', southeast = 'se', southwest = 'sw',
+      up = 'u', down = 'd'
+   }
+   -- Normalize common abbreviations (allow 'north' or 'n')
+   local key = synonyms[d] or d
+   -- If user passed full-word like 'down' or single-letter 'd', key should resolve.
+   -- Ensure we prefer exact keys in DIR_OFFSETS; accept single-letter defaults as-is.
+   local delta = DIR_OFFSETS[key]
+   -- If still not found, try taking first char (e.g., user typed 'down' -> 'd')
+   if not delta and #d > 1 then
+      local first = d:sub(1,1)
+      delta = DIR_OFFSETS[first]
+   end
+   if not delta then
+      print("Grid Mapper: Unknown direction '" .. dir_raw .. "'. Use n/s/e/w/u/d or north/south/etc.")
+      return
+   end
+
+   -- Apply to selected rooms if any, otherwise to current_room
+   local targets = {}
+   if next(selected_rooms) then
+      for uid in pairs(selected_rooms) do table.insert(targets, uid) end
+   elseif current_room then
+      table.insert(targets, tostring(current_room))
+   else
+      print("Grid Mapper: No current room selected to shift.")
+      return
+   end
+
+   for _, uid in ipairs(targets) do
+      if not room_positions[uid] then
+         room_positions[uid] = {x = 0, y = 0, z = 0}
+      end
+      local pos = room_positions[uid]
+      pos.x = (pos.x or 0) + (delta.x or 0)
+      pos.y = (pos.y or 0) + (delta.y or 0)
+      pos.z = (pos.z or 0) + (delta.z or 0)
+      -- Snap to half-grid to keep consistency with dragging behavior (plugin uses 0.5 steps)
+      pos.x = math.floor(pos.x * 2 + 0.5) / 2
+      pos.y = math.floor(pos.y * 2 + 0.5) / 2
+      save_room_position(uid)
+   end
+
+   auto_center()
+   draw_map()
+   print("Grid Mapper: Shifted " .. #targets .. " room(s) " .. dir_raw)
+end
  ]]>
  </script>
  </muclient>
