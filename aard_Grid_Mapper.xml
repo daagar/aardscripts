@@ -690,6 +690,12 @@ function OnPluginBroadcast(msg, id, name, text)
                         end
                         if not placed then
                            fill_unpositioned_rooms()
+                           -- Safety check: if current room STILL has no position after fill_unpositioned_rooms,
+                           -- place it at origin to ensure it's always visible
+                           if not room_positions[current_room] then
+                              room_positions[tostring(current_room)] = {x = 0, y = 0, z = 0}
+                              save_room_position(current_room)
+                           end
                         end
                      end
                  end
